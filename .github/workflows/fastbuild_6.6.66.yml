@@ -1,79 +1,79 @@
-name:6.6.66欧加真OKI内核快速构建
+name: 6.6.66 欧加真OKI内核快速构建
 
 env:
-TZ: 亚洲/上海
-Android_VERSION: 'android15'
-kernel_VERSION: '6.6'
-sub_VERSION: '66'
-kernel_NAME: 'android15-8-g29d86c5fc9dd-abogki428889875-4k'
-ccache_KEY: ccache-ecsv4-6.6.66
+  TZ: Asia/Shanghai
+  ANDROID_VERSION: 'android15'
+  KERNEL_VERSION: '6.6'
+  SUB_VERSION: '66'
+  KERNEL_NAME: 'android15-8-g29d86c5fc9dd-abogki428889875-4k'
+  CCACHE_KEY: ccache-ecsv4-6.6.66
 
-在……之上:
-workflow_dispatch:
-输入:
-KSU_type:
-描述: 'KernelSU分支(BakaSU/SukiSU Ultra/KernelSU Next/KSU(原版)/无内置KSU，默认BakaSU)'
-必需的: 正确
-类型: 选择
-        default: ‘巴卡苏
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_type:
+        description: 'KernelSU分支(BakaSU/SukiSU Ultra/KernelSU Next/KSU(原版)/无内置KSU,默认BakaSU)'
+        required: true
+        type: choice
+        default: 'bakasu'
         options:
-          - ‘bakasu’
+          - 'bakasu'
           - 'sukisu'
           - 'ksunext'
           - 'ksu'
-          - '无'
-susfs_enable:
-描述: '是否开启susfs(用于增强隐藏环境挂载功能; 可能轻微增加耗电，上游更新导致不稳定时或不需要可关闭)'
-必需的: 正确
-类型: 布尔型
+          - 'none'
+      susfs_enable:
+        description: '是否开启susfs(用于增强隐藏环境挂载功能; 可能轻微增加耗电，上游更新导致不稳定时或不需要可关闭)'
+        required: true
+        type: boolean
         default: 'true'
-KPM_enable:
-描述: '是否开启kpm(使用KpatchNext独立实现kpm(支持任意KSU/面具环境)；不需要可保持默认关闭)'
-必需的: 正确
-类型: 布尔型
+      kpm_enable:
+        description: '是否开启kpm(使用KpatchNext独立实现kpm(支持任意KSU/面具环境); 不需要可保持默认关闭)'
+        required: true
+        type: boolean
         default: 'false'
-LZ4_enable:
-描述: '是否安装lz41.10.0+zstd1.5.7补丁'
-必需的: 正确
-类型: 布尔型
+      lz4_enable:
+        description: '是否安装 lz4 1.10.0+zstd 1.5.7 补丁'
+        required: true
+        type: boolean
         default: 'true'
-lz4kd_enable:
-描述: '是否安装LZ4KD补丁(若已开启lz4+zstd补丁则可不开启)'
-必需的: 正确
-类型: 布尔型
+      lz4kd_enable:
+        description: '是否安装 LZ4KD 补丁(若已开启lz4+zstd补丁则可不开启)'
+        required: true
+        type: boolean
         default: 'false'
-BBR_enable:
-描述: "是否启用bbr算法(优化上行数据,对手机日用无太大意义甚至可能负优化;false关闭,true仅加入算法,default启用算法并设为默认)"
-必需的: 正确
-类型: 选择
+      bbr_enable:
+        description: "是否启用bbr算法(优化上行数据,对手机日用无太大意义甚至可能负优化;false关闭,true仅加入算法,default启用算法并设为默认)"
+        required: true
+        type: choice
         default: 'false'
- 选项:
+        options:
           - 'false'
           - 'true'
-          - '默认'
-droidspaces_enable:
-描述: '是否启用Droidspaces容器支持(轻量化的完整Linux容器支持；false关闭，标准开启容器+ntsync支持，延伸开启更多测试支持项)'
-必需的: 正确
-类型: 选择
+          - 'default'
+      droidspaces_enable:
+        description: '是否启用Droidspaces容器支持(轻量化的完整Linux容器支持;false关闭,standard开启容器+ntsync支持,extend开启更多测试支持项)'
+        required: true
+        type: choice
         default: 'false'
- 选项:
+        options:
           - 'false'
-          - '标准'
-          - '扩展'
+          - 'standard'
+          - 'extend'
       better_net:
-描述: '是否开启网络功能拓展配置(用于为ipset及需要iptables等高级网络功能内核支持的程序提供支持)'
-必需的: 正确
-类型: 布尔型
+        description: '是否开启网络功能拓展配置(用于为ipset及需要iptables等高级网络功能内核支持的程序提供支持)'
+        required: true
+        type: boolean
         default: 'false'
       adios_enable:
-描述: '是否启用ADIOS IO调度器支持(提升IO读写性能)'
-必需的: 正确
-类型: 布尔型
+        description: '是否启用ADIOS IO调度器支持(提升IO读写性能)'
+        required: true
+        type: boolean
         default: 'true'
       rekernel_enable:
-描述: '是否启用Re-Kernel支持(与Freezer/NoActive等软件配合, 提升应用冻结能力)'
-必需的: 正确
-类型: 布尔型
+        description: '是否启用Re-Kernel支持(与Freezer/NoActive等软件配合, 提升应用冻结能力)'
+        required: true
+        type: boolean
         default: 'false'
       baseband_guard:
         description: '是否开启内核级基带保护(阻止一切对非用户分区的写入，有效防止格机)'
@@ -242,7 +242,7 @@ jobs:
         run: |
           cd kernel_workspace
           if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" || ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
-            echo "正在配置BakaSU（由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu）..."
+            echo "正在配置BakaSU..."
             curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
             echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
@@ -264,7 +264,7 @@ jobs:
             wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/apk_sign.patch
             patch -p2 -N -F 3 < apk_sign.patch || true
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksu" ]]; then
-            echo "正在配置原版 KernelSU (tiann/KernelSU)..."
+            echo "正在配置原版 KernelSU..."
             curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/refs/heads/main/kernel/setup.sh" | bash -s main
             cd ./KernelSU
             KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/tiann/KernelSU/commits?sha=main&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 30000)
@@ -502,16 +502,12 @@ jobs:
           sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
           echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
 
-      # =====================================================================
-      # 指纹伪造内核模块源码注入（新增）
-      # =====================================================================
       - name: 注入指纹伪造内核模块源码
         run: |
           cd kernel_workspace
           mkdir -p fp_spoof
           cat > fp_spoof/fp_spoof.c <<'FPEOF'
           // fp_spoof.c — OnePlus Ace 5 至尊版 (PLC110 / Dimensity 9400+ / Android 15)
-          // 最终版：.ko重命名为tcs3720.ko | 伪装/sys/module | 清除taint | CPU频率伪装
           #include <linux/module.h>
           #include <linux/kernel.h>
           #include <linux/kprobes.h>
@@ -920,7 +916,6 @@ jobs:
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
           
-          # ===== 编译指纹伪造模块（out-of-tree，独立 .ko）=====
           echo "开始编译指纹伪造内核模块..."
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld \
@@ -935,7 +930,7 @@ jobs:
           fi
           cp -fv "$KO_PATH" $(pwd)/../fp_spoof/tcs3720.ko
           ls -l $(pwd)/../fp_spoof/tcs3720.ko
-          echo "指纹模块编译完成（最终名 tcs3720.ko，/sys/module 下也显示 tcs3720）"
+          echo "指纹模块编译完成（最终名 tcs3720.ko）"
           
           echo "内核编译完成！"
           echo "ccache状态："
@@ -975,7 +970,6 @@ jobs:
             exit 1
           fi
 
-          # ===== 复制指纹模块 tcs3720.ko 到 zip 的 modules/ 目录 =====
           mkdir -p ./modules
           if [ ! -f ../fp_spoof/tcs3720.ko ]; then
             echo "错误：未找到 ../fp_spoof/tcs3720.ko"
@@ -985,7 +979,6 @@ jobs:
           echo "准备打包的模块："
           ls -l ./modules/
 
-          # ===== 往 anykernel.sh 注入"安装 tcs3720.ko 到 vendor/lib/modules"逻辑 =====
           python3 - <<'PYEOF'
           import re
           p = 'anykernel.sh'
@@ -1030,38 +1023,38 @@ jobs:
             KSU_TYPENAME="SukiSU"
           elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
             KSU_TYPENAME="BakaSU"
-Elif[[${{github.event.inputs.ksu_type}}=="ksunext"]]；然后
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
             KSU_TYPENAME="KSUNext"
-Elif[[${{github.event.inputs.ksu_type}}=="ksu"]]；然后
-KSU_TYPENAME="KSU"
-其他
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksu" ]]; then
+            KSU_TYPENAME="KSU"
+          else
             KSU_TYPENAME="none"
 Fi
           if [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
-wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
+            wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
 Fi
           if [[ ${{ github.event.inputs.kpm_enable }} == 'true' ]]; then
-wget https://github.com/cctv18/KPatch-Next/releases/latest/download/kpn.zip
+            wget https://github.com/cctv18/KPatch-Next/releases/latest/download/kpn.zip
 Fi
           if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
-            AK3_NAME=AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_${{ github.event.inputs.kernel_suffix }}.zip
+            AK3_NAME=AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{env.KERNEL_VERSION}}_${{ github.event.inputs.kernel_suffix }}.zip
 其他
-            AK3_NAME=AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_${{ env.KERNEL_NAME }}.zip
+            AK3_NAME=AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{env.KERNEL_VERSION}}_${{env.KERNEL_NAME}}.zip
 Fi
-zip-r../$AK3_NAME./*
+          zip -r ../$AK3_NAME ./*
           echo "ak3name=$AK3_NAME" >> $GITHUB_OUTPUT
           
           if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
-            FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ github.event.inputs.kernel_suffix }}
+full_VERSION=${{env.KERNEL_VERSION}}.${{ env.SUB_VERSION }}-${{ github.event.inputs.kernel_suffix }}
 其他
-            FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ env.KERNEL_NAME }}
+full_VERSION=${{env.KERNEL_VERSION}}.${{ env.SUB_VERSION }}-${{env.KERNEL_NAME}}
 Fi
-time_NOW="$(TZ='亚洲/上海'日期+'%Y-%m-%d%H：%M：%S')"
-echo"作者: $GITHUB_ACTOR">./ak3.log
-echo"回购: $GITHUB_REPOSITORY">>./ak3.log
-echo”分支: $GITHUB_REF_NAME">>./ak3.log
-echo“运行ID: $GITHUB_RUN_ID">>./ak3.log
-回显“提交”: $GITHUB_SHA">>./ak3.log
+          TIME_NOW="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+          echo "Author: $GITHUB_ACTOR" > ./ak3.log
+          echo "Repo: $GITHUB_REPOSITORY">>./ak3.log
+          echo "Branch: $GITHUB_REF_NAME">>./ak3.log
+          echo "Run ID: $GITHUB_RUN_ID">>./ak3.log
+          echo "Commit: $GITHUB_SHA">>./ak3.log
 回显“时间: $TIME_NOW">>./ak3.log
 echo“内核版本: $FULL_VERSION">>./ak3.log
 echo”KSU分支: ${KSU_TYPENAME}">>./ak3.log
@@ -1080,7 +1073,7 @@ echo”BBG: ${{github.event.inputs.baseband_guard}}">>./ak3.log
 zip-z../$AK3_NAME<./ak3.log
 
       - 姓名: 上传ccache调试日志
-如果: always() && inputs.ccache_debug
+        if: always() && inputs.ccache_debug
 uses: actions/upload-artifact@v7
 和……一起:
 姓名: ccache-debug-log
@@ -1113,7 +1106,7 @@ uses: actions/download-artifact@v8
 跑: |
           if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
             FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ github.event.inputs.kernel_suffix }}
-回声"FULL_VERSION=$FULL_VERSION">>$GITHUB_ENV
+如果[[-n"${{github.event.inputs.kernel_suffix}}"]]；然后"FULL_VERSION=$FULL_VERSION">>$GITHUB_ENVGitHub。事件。输入KSU_type>>$GITHUB_ENV
 导出full_VERSION=$FULL_VERSION
 其他
 full_VERSION=${{它们的核心是}}.${{ env.SUB_VERSION }}-${{env.KERNEL_NAME}}
@@ -1126,49 +1119,49 @@ time_FORM="$(TZ='亚洲/上海'日期+'%Y-%m-%d%H：%M：%S')"
 回声"TIME_FORM=$TIME_FORM">>$GITHUB_ENV
 tag_HEAD="Oppo-OPlus-Realme-Build"
 回声"TAG_HEAD=$TAG_HEAD">>$GITHUB_ENV
-如果[[${{github.event.inputs.ksu_type}}=="sukisu"]]；则
-KSU_TYPENAME="SukiSU Ultra"
-Elif[[${{github.event.inputs.ksu_type}}=="bakasu"]]；然后
-KSU_TYPENAME="BakaSu"
-Elif[[${{github.event.inputs.ksu_type}}=="ksunext"]]；然后
+如果[[${{github.event.inputs.ksu_typeElif}=="sukisu"]]；则[[${{github.event.inputs.ksu_type}}=="sukisu"]]；则
+KSU_TYPENAME="SukiSU Ultra""SukiSU Ultra"
+Elif[[${{github.event.inputs.ksu_type}}=="bakasu"]]；然后[[${{github.event.inputs.ksu_type}}=="bakasu"]]；然后
+KSU_TYPENAME="BakaSu""BakaSu"
+Elif[[${{github.event.inputs.ksu_type}}=="ksunext"]]；然后[[${{github.event.inputs.ksu_type}}=="ksunext"]]；然后
 KSU_TYPENAME="KernelSU下一个"
 Elif[[${{github.event.inputs.ksu_type}}=="ksu"]]；然后
 KSU_TYPENAME="KSU"
 其他
 KSU_TYPENAME="无内置KSU"
 Fi
-回声"KSU_TYPENAME=$KSU_TYPENAME" >> $GITHUB_ENV
+回声"KSU_TYPENAME=$KSU_TYPENAME">>$GITHUB_ENV
          
--姓名：创建发布
-身份标识: 创建释放(_R)
+      - 姓名: 创建发布
+身份标识: 创建释放(_R)：创建释放(_R): 创建释放(_R)
 env：
-GitHub_TOKEN：${{secrets.GITHUB_TOKEN}}
-跑：|
-猫<<'EOF'>release_notes.md
+GitHub_TOKEN：${{secrets.GITHUB_TOKEN}}：${{secrets.GITHUB_TOKEN}}: ${{secrets.GITHUB_TOKEN}}
+跑：|:|: |: |
+猫<<'EOF'>release_notes.md'EOF'>release_notes.md'EOF'>release_notes.md'EOF'>release_notes.md
 ### 📱 欧加真${{env.KSU_TYPENAME}}SM8750通用内核|构建信息
--内核版本号：${{更多关于:}}
--编译时间：${{env.TIME_FORM}}
--机型：欧加真骁龙8Elite通用${{它们的核心是}}.${{env.SUB_VERSION}}内核(基于一加13${{它们的核心是}}.${{env.SUB_VERSION}}版官方OKI源代码)
--KSU分支：${{env.KSU_TYPENAME}}
--susfs支持：${{github.event.inputs.susfs_enable}}
--KPM支持：${{github.event.inputs.kpm_enable}}
--LZ4支持：${{github.event.inputs.lz4_enable}}
--LZ4KD支持：${{github.event.inputs.lz4kd_enable}}
--网络功能增强：${{github.event.inputs.better_net}}
--BBR/Brutal等拥塞控制算法支持：${{github.event.inputs.bbr_enable}}
--Droidspaces容器支持：${{github.event.inputs.droidspaces_enable}}
--ADIOS IO调度器支持：${{github.event.inputs.adios_enable}}
--重新内核支持：${{github.event.inputs.rekernel_enable}}
--内核级基带保护支持：${{github.event.inputs.baseband_guard}}
+-内核版本号：${{更多关于:}}{{更多关于:}}{{更多关于:}}{{更多关于:}}
+-编译时间：${{env.TIME_FORM}}{{env.TIME_FORM}}{{env.TIME_FORM}}{{env.TIME_FORM}}
+-机型：欧加真骁龙8Elite通用${{它们的核心是}}.${{env.SUB_VERSION}}内核(基于一加13${{它们的核心是}}.${{env.SUB_VERSION}}版官方OKI源代码){{它们的核心是}}.${{env.SUB_VERSION}}内核(基于一加13${{它们的核心是}}.${{env.SUB_VERSION}}版官方OKI源代码){{它们的核心是}}.${{env.SUB_VERSION}}内核(基于一加13${{它们的核心是}}.${{env.SUB_VERSION}}版官方OKI源代码){{它们的核心是}}.${{env.SUB_VERSION}}内核(基于一加13${{它们的核心是}}.${{env.SUB_VERSION}}版官方OKI源代码)
+-KSU分支：${{env.KSU_TYPENAME}}{{env.KSU_TYPENAME}}{{env.KSU_TYPENAME}}{{env.KSU_TYPENAME}}
+-susfs支持：${{GitHub。事件。输入.susfs_enable}}{{GitHub。事件。输入{\f2.susfs_enable}}{{github.event.inputs.susfs_enable}}{{github.event.inputs.susfs_enable}}
+-KPM支持：${{GitHub。事件。inputs.KPM_enable}}{{GitHub。事件。输入{\f25KPM_enable}}{{github.event.inputs.kpm_enable}}{{github.event.inputs.kpm_enable}}
+-LZ4支持：${{GitHub。事件。输入.LZ4_enable}}{{GitHub。事件。输入{\f25LZ4_enable}{{github.event.inputs.lz4_enable}}{{github.event.inputs.lz4_enable}}
+-LZ4KD支持：${{GitHub。事件。输入。lz4kd_enable}}{{GitHub。事件。输入{\f25.lz4kd_enable}{{github.event.inputs.lz4kd_enable}}{{github.event.inputs.lz4kd_enable}}
+-网络功能增强：${{GitHub。事件。输入。better_net}}{{GitHub。事件，进口。better_net}}{{github.event.inputs.better_net}}{{github.event.inputs.better_net}}
+-BBR/Brutal等拥塞控制算法支持：${{GitHub。事件。输入。BBR_enable}}{{GitHub。事件。输入{\f2BBR_enable}{{github.event.inputs.bbr_enable}}{{github.event.inputs.bbr_enable}}
+-Droidspaces容器支持：${{GitHub。事件，进口。droidspaces_enable}}{{GitHub。事件。输入.droidspaces_enable}}{{github.event.inputs.droidspaces_enable}}{{github.event.inputs.droidspaces_enable}}
+-ADIOS IO调度器支持：${{GitHub。事件，进口。Adios_enable}}{{GitHub。事件，进口。Adios_enable}}{{github.event.inputs.adios_enable}}{{github.event.inputs.adios_enable}}
+-重新内核支持：${{GitHub。事件。输入。rekernel_enable}}{{GitHub。事件。输入.rekernel_enable}}{{github.event.inputs.rekernel_enable}}{{github.event.inputs.rekernel_enable}}
+-内核级基带保护支持：${{github.event.inputs.baseband_guard}}{{github.event.inputs.baseband_guard}}
 -传感器驱动模块(tcs3720.ko)：已打包至zip内modules/
 -巴卡苏管理器下载：[BakaSU_CI](https://github.com/cctv18/BakaSU_CI/releases)
--SukiSU Ultra管理器下载：[SukiSu-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
--KernelSU下一个管理器下载：[KernelSu-Next](https://github.com/KernelSU-Next/KernelSU-Next/releases)
+-SukiSU Ultra管理器下载：[SukiSu-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)[SukiSu-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
+-KernelSU下一个管理器下载：[KernelSu-Next](https://github.com/KernelSU-Next/KernelSU-Next/releases)[KernelSu-Next](https://github.com/KernelSU-Next/KernelSU-Next/releases)
 -KSU原版管理器下载：[KernelSU](https://github.com/tiann/KernelSU/releases)
           
 ###渐️更新内容：
 -更新${{env.KSU_TYPENAME}}至最新版本(${{decies.build.outputs.ksuver}})
--内置传感器驱动模块 tcs3720.ko（伪装名，实际为指纹伪造模块）
+          - 内置传感器驱动模块 tcs3720.ko（伪装名，实际为指纹伪造模块）
           
 ### 📋 安装方法|安装指南
 1.若你的手机已经安装了第三方恢复(如TWRP)，可下载对应机型的AnyKernel刷机包后进入恢复模式，通过恢复刷入刷机包后重启设备；
