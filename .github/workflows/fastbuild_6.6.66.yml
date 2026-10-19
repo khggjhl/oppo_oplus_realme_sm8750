@@ -979,9 +979,9 @@ jobs:
           
           if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
             FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ github.event.inputs.kernel_suffix }}
-其他
+          else
             FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ env.KERNEL_NAME }}
-Fi
+          fi
           TIME_NOW="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
           echo "Author: $GITHUB_ACTOR" > ./ak3.log
           echo "Repo: $GITHUB_REPOSITORY" >> ./ak3.log
@@ -1005,104 +1005,104 @@ Fi
           echo "Fingerprint Module: tcs3720.ko" >> ./ak3.log
           zip -z ../$AK3_NAME < ./ak3.log
 
-      - 姓名: 上传 Ccache 调试日志
-如果：always() && inputs.ccache_debug
-uses：actions/upload-artifact@v7
-和……一起:
-姓名: ccache-debug-log
-路径: ${{github.workspace}}/kernel_workspace/ccache.log
-存档: 正确
+      - name: 上传 Ccache 调试日志
+        if: always() && inputs.ccache_debug
+        uses: actions/upload-artifact@v7
+        with:
+          name: ccache-debug-log
+          path: ${{ github.workspace }}/kernel_workspace/ccache.log
+          archive: true
 
--姓名: 上传ZIP工件
-uses: actions/upload-artifact@v7
-和……一起:
-路径: ${{github.workspace}}/kernel_workspace/AnyKernel*.zip
-存档: 假的
+      - name: 上传 ZIP 工件
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
+          archive: false
 
-释放:
-需要: 建立
-run-on: ubuntu-最新
-权限:
-内容: 写
-包: 写
-行动: 读
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      actions: read
       
-步骤:
-      - 姓名: 下载ZIP工件
-用法：操作/下载工件@v8
-和……一起:
-姓名: ${{needs.build.outputs.ak3name}}
-路径: ./release_zips
-跳跃解压缩: 正确
+    steps:
+      - name: 下载 ZIP 工件
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.ak3name }}
+          path: ./release_zips
+          skip-decompress: true
 
--姓名: 设置环境变量
-跑: |
+      - name: 设置环境变量
+        run: |
           if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
             FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ github.event.inputs.kernel_suffix }}
-回声"FULL_VERSION=$FULL_VERSION">>$GITHUB_ENV
-导出full_VERSION=$FULL_VERSION
-其他
-full_VERSION=${{它们的核心是}}.${{ env.SUB_VERSION }}--没有env.KERNEL_NAME{env.KERNEL_NAME}}
-回声"FULL_VERSION=$FULL_VERSION">>$GITHUB_ENV
-导出full_VERSION=$FULL_VERSION
-Fi
-时间="$(TZ='亚洲/上海'日期+'%y%m%d%H%M%S')"
-time_FORM="$(TZ='亚洲/上海'日期+'%Y-%m-%d%H：%M：%S')"
-回声"TIME=$TIME">>$GITHUB_ENV
-回声"TIME_FORM=$TIME_FORM">>$GITHUB_ENV
-tag_HEAD="Oppo-OPlus-Realme-Build"
-回声"TAG_HEAD=$TAG_HEAD">>$GITHUB_ENV
-如果[[${{github.event.inputs.ksu_type}}=="sukisu" ]]然后
-KSU_TYPENAME="SukiSU Ultra"
-Elif[[${{github.event.inputs.ksu_type}}=="bakasu" ]]然后
-KSU_TYPENAME="BakaSu"
-Elif[[${{github.event.inputs.ksu_type}}=="ksunext" ]]然后
-KSU_TYPENAME="KernelSU下一个""KernelSU下一个"
-Elif[[${{github.event.inputs.ksu_type}}=="ksu"]]；然后[[${{github.event.inputs.ksu_type}}=="ksu" ]]然后
-KSU_TYPENAME="KSU""KSU"
-其他
-KSU_TYPENAME="无内置KSU"
-Fi
-回声"KSU_TYPENAME=$KSU_TYPENAME">>$GITHUB_ENV"KSU_TYPENAME=$KSU_TYPENAME">>$GITHUB_ENV
+            echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+            export FULL_VERSION=$FULL_VERSION
+          else
+            FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ env.KERNEL_NAME }}
+            echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+            export FULL_VERSION=$FULL_VERSION
+          fi
+          TIME="$(TZ='Asia/Shanghai' date +'%y%m%d%H%M%S')"
+          TIME_FORM="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+          echo "TIME=$TIME" >> $GITHUB_ENV
+          echo "TIME_FORM=$TIME_FORM" >> $GITHUB_ENV
+          TAG_HEAD="OPPO-OPlus-Realme-build"
+          echo "TAG_HEAD=$TAG_HEAD" >> $GITHUB_ENV
+          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            KSU_TYPENAME="SukiSU Ultra"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
+            KSU_TYPENAME="BakaSU"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
+            KSU_TYPENAME="KernelSU Next"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksu" ]]; then
+            KSU_TYPENAME="KSU"
+          else
+            KSU_TYPENAME="无内置KSU"
+          fi
+          echo "KSU_TYPENAME=$KSU_TYPENAME" >> $GITHUB_ENV
          
--姓名: 创建发布
-身份标识: 创建释放(_R)
-env:
-GitHub_TOKEN: ${{secrets.GITHUB_TOKEN}}
-跑: |
-猫<<'EOF'>release_notes.md
-### 📱 欧加真${{env.KSU_TYPENAME}}SM8750通用内核|构建信息
--内核版本号：${{更多关于:}}
--编译时间：${{env.TIME_FORM}}
--机型：欧加真骁龙8Elite通用${{它们的核心是}}.${{env.SUB_VERSION}}内核
--KSU分支：${{env.KSU_TYPENAME}}
--susfs支持：${{github.event.inputs.susfs_enable}}
--KPM支持：${{github.event.inputs.kpm_enable}}
--LZ4支持：${{github.event.inputs.lz4_enable}}
--LZ4KD支持：${{github.event.inputs.lz4kd_enable}}
--网络功能增强：${{github.event.inputs.better_net}}
-然后{{github.event.inputs.bbr_enable}}
--Droidspaces容器支持：${{github.event.inputs.droidspaces_enable}}
--ADIOS IO调节器支持：${{github.event.inputs.adios_enable}}
--重新内核支持：${{github.event.inputs.rekernel_enable}}
--内核级基带保护支持：${{github.event.inputs.baseband_guard}}
--传感器驱动模块(tcs3720.ko)：已打包至zip内modules/传感器驱动模块(tcs3720.ko)：已打包至zip内modules/
+      - name: 创建发布
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat << 'EOF' > release_notes.md
+          ### 📱 欧加真 ${{ env.KSU_TYPENAME }} SM8750 通用内核 | 构建信息
+          - 内核版本号: ${{ env.FULL_VERSION }}
+          - 编译时间: ${{ env.TIME_FORM }}
+          - 机型：欧加真骁龙8Elite通用 ${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }} 内核
+          - KSU分支：${{ env.KSU_TYPENAME }}
+          - susfs支持：${{ github.event.inputs.susfs_enable }}
+          - KPM支持 ：${{ github.event.inputs.kpm_enable }}
+          - LZ4支持：${{ github.event.inputs.lz4_enable }}
+          - LZ4KD支持：${{ github.event.inputs.lz4kd_enable }}
+          - 网络功能增强：${{ github.event.inputs.better_net }}
+          - BBR/Brutal 等拥塞控制算法支持：${{ github.event.inputs.bbr_enable }}
+          - Droidspaces 容器支持：${{ github.event.inputs.droidspaces_enable }}
+          - ADIOS IO调度器支持：${{ github.event.inputs.adios_enable }}
+          - Re-Kernel支持：${{ github.event.inputs.rekernel_enable }}
+          - 内核级基带保护支持：${{ github.event.inputs.baseband_guard }}
+          - 传感器驱动模块 (tcs3720.ko)：已打包至 zip 内 modules/
           
-          ###渐️更新内容：
--更新${{env.KSU_TYPENAME}}至最新版本(${{十之八九。建立。产出。ksuver}}){{env.KSU_TYPENAME}}至最新版本(${{decies.build.outputs.ksuver}})
--内置传感器驱动模块tcs3720.ko(伪装名)内置传感器驱动模块tcs3720.ko(伪装名)
+          ### ⏫️ 更新内容：
+          - 更新${{ env.KSU_TYPENAME }}至最新版本（${{ needs.build.outputs.ksuver }}）
+          - 内置传感器驱动模块 tcs3720.ko（伪装名）
           
-### 📋 安装方法
-1.下载对应机型的AnyKernel刷机包，进入恢复模式或使用第三方刷机软件（如HorizonKernelFlasher)刷入。
-2.刷入后ts3720.ko会被安装到/vendor/lib/modules/或/system/lib/modules/，**不会自动加载**。
-3.手动加载：'Su-c"insmod/vendor/lib/modules/tcs3720.ko"‘（如果SELinux拦截，请使用KSU/Magisk模块在开机早期加载）。'Su-c"insmod/vendor/lib/modules/tcs3720.ko"‘（如果SELinux拦截，请使用KSU/Magisk模块在开机早期加载）。'Su-c"insmod/vendor/lib/modules/tcs3720.ko"‘（如果SELinux拦截，请使用KSU/Magisk模块在开机早期加载）。'Su-c"insmod/vendor/lib/modules/tcs3720.ko"‘（如果SELinux拦截，请使用KSU/Magisk模块在开机早期加载）。
-4.APK通过'socket(AF_INET，SOCK_Dgram，0)'获取控制fd，再用'ioctl(fd，FP_CMD_*，&rule)'下发规则.'socket(AF_INET，SOCK_Dgram，0)'获取控制fd，再用'ioctl(fd，FP_CMD_*，&rule)'下发规则.'socket(AF_INET，SOCK_Dgram，0)'获取控制fd，再用'ioctl(fd，FP_CMD_*，&rule)'下发规则.'socket(AF_INET，SOCK_Dgram，0)'获取控制fd，再用'ioctl(fd，FP_CMD_*，&rule)'下发规则.
+          ### 📋 安装方法
+          1. 下载对应机型的AnyKernel刷机包，进入Recovery模式或使用第三方刷机软件（如 HorizonKernelFlasher）刷入。
+          2. 刷入后 tcs3720.ko 会被安装到 /vendor/lib/modules/ 或 /system/lib/modules/，**不会自动加载**。
+          3. 手动加载：`su -c "insmod /vendor/lib/modules/tcs3720.ko"`（如果 SELinux 拦截，请使用 KSU/Magisk 模块在开机早期加载）。
+          4. APK 通过 `socket(AF_INET, SOCK_DGRAM, 0)` 获取控制 fd，再用 `ioctl(fd, FP_CMD_*, &rule)` 下发规则。
           
           #### ※※※刷写内核有风险，在刷入内核前请务必备份boot等关键启动分区!※※※
-EOF
+          EOF
 
-GH发布创建"${{env.TAG_HEAD}}--没有{{环境时间}}”\"${{env.TAG_HEAD}}--没有{{环境时间"${{env.TAG_HEAD}}--没有{{环境时间}}”\"${{env.TAG_HEAD}}- - 没有{{环境时间}}" \}" \
-            --repo "${{ github.repository }}" \"${{ github.repository }}" \
-            --title "${{env.TAG_HEAD}}-${{env.FULL_VERSION}}" \"${{env.TAG_HEAD}}-${{env.FULL_VERSION}}" \
+          gh release create "${{ env.TAG_HEAD }}-${{ env.TIME }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ env.TAG_HEAD }}-${{ env.FULL_VERSION }}" \
             --notes-file release_notes.md \
-release_zips/AnyKernel3_*.zip
+            release_zips/AnyKernel3_*.zip
