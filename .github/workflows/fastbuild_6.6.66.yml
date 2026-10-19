@@ -120,10 +120,7 @@ jobs:
           sudo rm -rf /var/lib/man-db/auto-update &&
           sudo apt update &&
           sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev &
-          #旧版完整指令：（由于经过验证大部分指令已内置于GitHub Action环境中，故进行精简）
-          #sudo apt-get install -y --no-install-recommends curl bison flex make binutils git perl gcc python3 python-is-python3 bc libssl-dev libelf-dev zip unzip ccache
           
-          #使用最新版ccache-ECS（特化优化内核编译缓存，大幅提升二次不同配置编译速度）
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/lib/ccache-x86-64 -O ccache &&
           sudo cp -f ./ccache /usr/bin/ccache &&
           sudo chmod +x /usr/bin/ccache &&
@@ -219,7 +216,6 @@ jobs:
       
       - name: 初始化并配置ccache
         run: |
-          # 设置ccache环境变量
           export CCACHE_COMPILERCHECK="none"
           export CCACHE_BASEDIR="${{ github.workspace }}"
           export CCACHE_NOHASHDIR="true"
@@ -227,19 +223,15 @@ jobs:
           export CCACHE_DIR="${{ env.CCACHE_DIR }}"
           export CCACHE_MAXSIZE="${{ env.CCACHE_MAXSIZE }}"
           
-          # 确保ccache目录存在
           mkdir -p "$CCACHE_DIR"
           
-          # 每次运行都重新配置缓存大小
           echo "配置ccache缓存大小为: $CCACHE_MAXSIZE"
           ccache -M "$CCACHE_MAXSIZE"
           ccache -o compression=true
           
-          # 显示初始缓存状态
           echo "ccache初始状态:"
           ccache -s
           
-          # 如果缓存恢复命中，显示详细信息
           if [ "${{ steps.ccache-restore.outputs.cache-hit }}" == 'true' ]; then
             echo "ccache缓存命中详情:"
             ccache -sv
@@ -248,16 +240,13 @@ jobs:
       - name: 添加KernelSU
         id: ksu_version
         run: |
-          # 进入内核工作目录
           cd kernel_workspace
           if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" || ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
             echo "正在配置BakaSU（由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu）..."
             curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
             echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
-            # 生成自定义版本号（基于提交计数）, 失败时使用 114514
             KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
-            # 存储版本号到 GitHub 环境变量
             echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
             echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
@@ -266,6 +255,941 @@ jobs:
             cd KernelSU-Next
             rm -rf .git
             KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/pershoot/KernelSU-Next/commits?sha=dev&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 30000)
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+            sed -i "s/KSU_VERSION_FALLBACK := 1/KSU_VERSION_FALLBACK := $KSU_VERSION/g" kernel/Kbuild
+            KSU_GIT_TAG=$(curl -sL "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/tags" | grep -o '"name": *"[^"]*"' | head -n 1 | sed 's/"name": "//;s/"//')
+            sed -i "s/KSU_VERSION_TAG_FALLBACK := v0.0.1/KSU_VERSION_TAG_FALLBACK := $KSU_GIT_TAG/g" kernel/Kbuild
+            cd ../common/drivers/kernelsu
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/apk_sign.patch
+            patch -p2 -N -F 3 < apk_sign.patch || true
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksu" ]]; then
+            echo "正在配置原版 KernelSU (tiann/KernelSU)..."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/refs/heads/main/kernel/setup.sh" | bash -s main
+            cd ./KernelSU
+            KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/tiann/KernelSU/commits?sha=main&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 30000)
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+            sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" kernel/Kbuild
+          else
+            echo "已选择无内置KernelSU模式，跳过KernelSU配置..."
+          fi
+
+      - name: 应用 KernelSU & SUSFS 补丁
+        if: inputs.susfs_enable
+        run: |
+          cd kernel_workspace
+          if [[ ${{ github.event.inputs.ksu_type }} != "none" ]]; then
+            echo "正在添加susfs补丁..."
+            git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/69_hide_stuff.patch -O ./common/69_hide_stuff.patch
+            cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+            cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+            cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+            cd ./common
+            patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+            patch -p1 -N -F 3 < 69_hide_stuff.patch || true
+            cd ..
+          else
+            echo "已选择无内置KernelSU模式，跳过susfs配置..."
+          fi
+          if [[ ${{ github.event.inputs.ksu_type }} == "ksu" ]]; then
+            echo "正在为原版 KernelSU (tiann/KernelSU)添加补丁..."
+            cp ./susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./KernelSU/
+            cd ./KernelSU
+            patch -p1 -F 3 < 10_enable_susfs_for_ksu.patch || true
+          fi
+          
+      - name: 应用lz4 1.10.0 & zstd 1.5.7补丁
+        if: inputs.lz4_enable
+        run: |
+          echo "正在添加lz4 1.10.0 & zstd 1.5.7补丁…"
+          cd kernel_workspace
+          git clone --depth=1 https://github.com/$GITHUB_REPOSITORY.git -b $GITHUB_REF_NAME $GITHUB_ACTOR
+          cp ./$GITHUB_ACTOR/zram_patch/001-lz4.patch ./common/
+          cp ./$GITHUB_ACTOR/zram_patch/lz4armv8.S ./common/lib
+          cp ./$GITHUB_ACTOR/zram_patch/002-zstd.patch ./common/
+          cd ./common
+          git apply -p1 < 001-lz4.patch || true
+          patch -p1 -F 3 < 002-zstd.patch || true
+
+      - name: 应用 lz4kd 补丁
+        if: inputs.lz4kd_enable
+        run: |
+          echo "正在添加lz4kd补丁…"
+          cd kernel_workspace
+          if [ ! -d "SukiSU_patch" ]; then
+            git clone --depth=1 https://github.com/ShirkNeko/SukiSU_patch.git
+          fi
+          cd common
+          cp -r ../SukiSU_patch/other/zram/lz4k/include/linux/* ./include/linux/
+          cp -r ../SukiSU_patch/other/zram/lz4k/lib/* ./lib
+          cp -r ../SukiSU_patch/other/zram/lz4k/crypto/* ./crypto
+          cp ../SukiSU_patch/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4kd.patch ./
+          patch -p1 -F 3 < lz4kd.patch || true
+          
+      - name: 添加SUSFS 配置项
+        if: inputs.susfs_enable
+        run: |
+          cd kernel_workspace
+          echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> ./common/arch/arm64/configs/gki_defconfig
+          
+      - name: 添加 KSU & 其他配置项
+        run: |
+          cd kernel_workspace
+          echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
+          if [[ "${{ github.event.inputs.susfs_enable }}" == "false" ]]; then
+            echo "CONFIG_KSU_SUSFS=n" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+          echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          if [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
+            echo "CONFIG_ZSMALLOC=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4HC=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4K=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_CRYPTO_842=y" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
+          sed -i 's/check_defconfig//' ./common/build.config.gki
+          echo "CONFIG_HEADERS_INSTALL=n" >> ./common/arch/arm64/configs/gki_defconfig
+          cd common
+          wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/cve-2026-43499-rtmutex-6.6.patch
+          patch -p1 -F 3 < cve-2026-43499-rtmutex-6.6.patch
+          
+      - name: 启用网络功能增强优化配置
+        if: inputs.better_net
+        run: |
+          cd kernel_workspace
+          echo "CONFIG_BPF_STREAM_PARSER=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_NETFILTER_XT_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_MAX=65534" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_BITMAP_IP=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_BITMAP_IPMAC=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_BITMAP_PORT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IP=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IPMARK=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IPPORT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IPPORTIP=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IPPORTNET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_IPMAC=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_MAC=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_NETPORTNET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_NET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_NETNET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_NETPORT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_HASH_NETIFACE=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP_SET_LIST_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP6_NF_NAT=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_IP6_NF_TARGET_MASQUERADE=y" >> ./common/arch/arm64/configs/gki_defconfig
+          cd common
+          wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/config.patch
+          patch -p1 -F 3 < config.patch || true
+
+      - name: 添加 BBR 等一系列拥塞控制算法
+        run: |
+          if [[ "${{ github.event.inputs.bbr_enable }}" != "false" ]]; then
+            echo "正在添加BBR等拥塞控制算法..."
+            cd kernel_workspace
+            echo "CONFIG_TCP_CONG_ADVANCED=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_BBR=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_CUBIC=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_VEGAS=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_NV=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_WESTWOOD=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_HTCP=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_TCP_CONG_BRUTAL=y" >> ./common/arch/arm64/configs/gki_defconfig
+            if [[ "${{ github.event.inputs.bbr_enable }}" == "default" ]]; then
+              echo "正在将BBR设为默认拥塞控制算法..."
+              echo "CONFIG_DEFAULT_TCP_CONG=bbr" >> ./common/arch/arm64/configs/gki_defconfig
+            else
+              echo "CONFIG_DEFAULT_TCP_CONG=cubic" >> ./common/arch/arm64/configs/gki_defconfig
+            fi
+          fi
+
+      - name: 启用 Droidspaces 容器支持
+        run: |
+          if [[ "${{ github.event.inputs.droidspaces_enable }}" != "false" ]]; then
+            echo "正在启用 Droidspaces 容器支持..."
+            cd kernel_workspace/common
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/fix_sysvipc_kabi_6_7_8.patch
+            patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch || true
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/fix_oplus_bsp_midas.patch
+            patch -p1 -F 3 < fix_oplus_bsp_midas.patch || true
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/ntsync_base.patch
+            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/ntsync_compat_${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
+            patch -p1 -F 3 < ntsync_base.patch || true
+            patch -p1 -F 3 < ntsync_compat_${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+            echo "CONFIG_PID_NS=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_IPC_NS=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_USER_NS=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_SYSVIPC=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_DEVTMPFS=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NAMESPACES=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_POSIX_MQUEUE=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NETFILTER_XT_TARGET_LOG=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y" >> ./arch/arm64/configs/gki_defconfig
+            echo "CONFIG_NTSYNC=y" >> ./arch/arm64/configs/gki_defconfig
+            if [[ "${{ github.event.inputs.droidspaces_enable }}" == "extend" ]]; then
+              echo "正在启用容器环境扩展支持..."
+              echo "CONFIG_BT_HCIVHCI=y" >> ./arch/arm64/configs/gki_defconfig
+              echo "CONFIG_STATIC_USERMODEHELPER=n" >> ./arch/arm64/configs/gki_defconfig
+              wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/evdi_drm.patch
+              patch -p1 -F 3 < evdi_drm.patch || true
+              echo "CONFIG_DRM_LINDROID_EVDI=y" >> ./arch/arm64/configs/gki_defconfig
+            fi
+          fi
+
+      - name: 启用ADIOS IO调度器
+        if: inputs.adios_enable
+        run: |
+          echo "正在启用ADIOS IO调度器..."
+          cd kernel_workspace
+          echo "CONFIG_MQ_IOSCHED_ADIOS=y" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y" >> ./common/arch/arm64/configs/gki_defconfig
+
+      - name: 启用Re-Kernel支持
+        if: inputs.rekernel_enable
+        run: |
+          echo "正在启用Re-Kernel支持..."
+          cd kernel_workspace
+          echo "CONFIG_REKERNEL=y" >> ./common/arch/arm64/configs/gki_defconfig
+
+      - name: 启用内核级基带保护
+        if: inputs.baseband_guard
+        run: |
+          echo "正在启用内核级基带保护支持..."
+          cd kernel_workspace
+          echo "CONFIG_BBG=y" >> ./common/arch/arm64/configs/gki_defconfig
+          cd ./common
+          curl -sSL https://github.com/cctv18/Baseband-guard/raw/master/setup.sh | bash
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+
+      - name: 添加制作名称
+        run: |
+          cd kernel_workspace
+          echo "替换内核版本后缀..."
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            echo "当前内核版本后缀：${{ github.event.inputs.kernel_suffix }}"
+            for f in ./common/scripts/setlocalversion; do
+              sed -i "\$s|echo \"\\\$res\"|echo \"-${{ github.event.inputs.kernel_suffix }}\"|" "$f"
+            done
+            sudo sed -i 's/-4k/-${{ github.event.inputs.KERNEL_SUFFIX }}/g' ./common/arch/arm64/configs/gki_defconfig
+          else
+            echo "当前内核版本后缀：${{ env.KERNEL_NAME }}"
+            for f in ./common/scripts/setlocalversion; do
+              sed -i "\$s|echo \"\\\$res\"|echo \"-${{ env.KERNEL_NAME }}\"|" "$f"
+            done
+            sudo sed -i 's/-4k/-${{ env.KERNEL_NAME }}/g' ./common/arch/arm64/configs/gki_defconfig
+          fi
+          sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
+
+      # =====================================================================
+      # 指纹伪造内核模块源码注入（新增）
+      # =====================================================================
+      - name: 注入指纹伪造内核模块源码
+        run: |
+          cd kernel_workspace
+          mkdir -p fp_spoof
+          cat > fp_spoof/fp_spoof.c <<'FPEOF'
+          // fp_spoof.c — OnePlus Ace 5 至尊版 (PLC110 / Dimensity 9400+ / Android 15)
+          // 最终版：.ko重命名为tcs3720.ko | 伪装/sys/module | 清除taint | CPU频率伪装
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          #include <linux/kprobes.h>
+          #include <linux/uaccess.h>
+          #include <linux/slab.h>
+          #include <linux/string.h>
+          #include <linux/spinlock.h>
+          #include <linux/jhash.h>
+          #include <linux/sched.h>
+          #include <linux/cred.h>
+          #include <linux/capability.h>
+          #include <linux/fs.h>
+          #include <linux/file.h>
+          #include <linux/anon_inodes.h>
+          #include <linux/net.h>
+          #include <linux/if.h>
+          #include <linux/in.h>
+          #include <linux/netdevice.h>
+          #include <linux/xarray.h>
+          #include <linux/minmax.h>
+
+          MODULE_LICENSE("GPL");
+          MODULE_AUTHOR("oplus");
+          MODULE_DESCRIPTION("OPLUS ALSPS Sensor Driver");
+          MODULE_VERSION("1.0");
+
+          #define FP_PATH_MAX   512
+          #define FP_SELF_NAME  "tcs3720"
+
+          enum fp_field {
+              FP_SERIAL, FP_WIFI_MAC, FP_BT_MAC, FP_CPU_MODEL,
+              FP_KERNEL_VERSION, FP_NET_MAC, FP_TAINTED, FP_CPU_FREQ, FP_FIELD_MAX,
+          };
+          #define FP_FIELD_COUNT FP_FIELD_MAX
+
+          struct fp_field_value { char fake[256]; __u32 len; };
+          struct fp_rule { __u32 uid; struct fp_field_value fields[FP_FIELD_COUNT]; };
+
+          #define FP_MAGIC          0x70
+          #define FP_CMD_SET_RULE   _IOW(FP_MAGIC, 1, struct fp_rule)
+          #define FP_CMD_GET_RULE   _IOWR(FP_MAGIC, 2, struct fp_rule)
+          #define FP_CMD_CLR_RULE   _IOW(FP_MAGIC, 3, struct fp_rule)
+          #define FP_CMD_CLEAR_ALL  _IO(FP_MAGIC, 4)
+
+          #define FP_BUCKETS 16
+          struct fp_rule_node { struct fp_rule rule; struct hlist_node node; };
+          static struct hlist_head fp_buckets[FP_BUCKETS];
+          static DEFINE_SPINLOCK(fp_rules_lock);
+
+          static inline u32 fp_hash_uid(u32 uid) { return jhash_1word(uid, 0x71ABC) & (FP_BUCKETS - 1); }
+          static u32 fp_current_uid(void) { return from_kuid(&init_user_ns, current_uid()); }
+
+          static struct fp_rule_node *rule_find_locked(u32 uid) {
+              struct fp_rule_node *p;
+              hlist_for_each_entry(p, &fp_buckets[fp_hash_uid(uid)], node)
+                  if (p->rule.uid == uid) return p;
+              return NULL;
+          }
+
+          static void fp_rule_init(void) { int i; for (i = 0; i < FP_BUCKETS; i++) INIT_HLIST_HEAD(&fp_buckets[i]); }
+
+          static void fp_rule_exit(void) {
+              int i; spin_lock(&fp_rules_lock);
+              for (i = 0; i < FP_BUCKETS; i++) {
+                  struct fp_rule_node *p; struct hlist_node *n;
+                  hlist_for_each_entry_safe(p, n, &fp_buckets[i], node) { hlist_del(&p->node); kfree(p); }
+              }
+              spin_unlock(&fp_rules_lock);
+          }
+
+          bool fp_rule_has(u32 uid) {
+              bool hit; spin_lock(&fp_rules_lock);
+              hit = rule_find_locked(uid) != NULL; spin_unlock(&fp_rules_lock); return hit;
+          }
+
+          int fp_rule_get_copy(u32 uid, enum fp_field f, struct fp_field_value *out) {
+              struct fp_rule_node *p; int ret = -ENOENT;
+              if (!out || (int)f < 0 || f >= FP_FIELD_COUNT) return -EINVAL;
+              spin_lock(&fp_rules_lock);
+              p = rule_find_locked(uid);
+              if (p) { memcpy(out, &p->rule.fields[f], sizeof(*out)); ret = 0; }
+              spin_unlock(&fp_rules_lock); return ret;
+          }
+
+          static int fp_rule_validate(struct fp_rule *r) {
+              int i;
+              for (i = 0; i < FP_FIELD_COUNT; i++) {
+                  if (r->fields[i].len >= 256) return -EINVAL;
+                  r->fields[i].fake[r->fields[i].len] = '\0';
+              }
+              return 0;
+          }
+
+          static int fp_rule_set_from_user(const struct fp_rule __user *arg) {
+              struct fp_rule *krule; struct fp_rule_node *p; int ret;
+              krule = kzalloc(sizeof(*krule), GFP_KERNEL);
+              if (!krule) return -ENOMEM;
+              if (copy_from_user(krule, arg, sizeof(*krule))) { kfree(krule); return -EFAULT; }
+              ret = fp_rule_validate(krule);
+              if (ret) { kfree(krule); return ret; }
+              spin_lock(&fp_rules_lock);
+              p = rule_find_locked(krule->uid);
+              if (p) { memcpy(&p->rule, krule, sizeof(p->rule)); spin_unlock(&fp_rules_lock); kfree(krule); return 0; }
+              spin_unlock(&fp_rules_lock);
+              p = kzalloc(sizeof(*p), GFP_KERNEL);
+              if (!p) { kfree(krule); return -ENOMEM; }
+              memcpy(&p->rule, krule, sizeof(p->rule));
+              INIT_HLIST_NODE(&p->node);
+              spin_lock(&fp_rules_lock);
+              if (rule_find_locked(krule->uid)) { spin_unlock(&fp_rules_lock); kfree(p); kfree(krule); return 0; }
+              hlist_add_head(&p->node, &fp_buckets[fp_hash_uid(krule->uid)]);
+              spin_unlock(&fp_rules_lock); kfree(krule); return 0;
+          }
+
+          static int fp_rule_get_to_user(struct fp_rule __user *arg) {
+              struct fp_rule_node *p; struct fp_rule *kin, *kout; int ret = -ENOENT;
+              kin = kmalloc(sizeof(*kin), GFP_KERNEL); kout = kzalloc(sizeof(*kout), GFP_KERNEL);
+              if (!kin || !kout) { kfree(kin); kfree(kout); return -ENOMEM; }
+              if (copy_from_user(kin, arg, sizeof(*kin))) { kfree(kin); kfree(kout); return -EFAULT; }
+              spin_lock(&fp_rules_lock);
+              p = rule_find_locked(kin->uid);
+              if (p) { memcpy(kout, &p->rule, sizeof(*kout)); ret = 0; }
+              spin_unlock(&fp_rules_lock); kfree(kin);
+              if (ret) { kfree(kout); return ret; }
+              ret = copy_to_user(arg, kout, sizeof(*kout)) ? -EFAULT : 0;
+              kfree(kout); return ret;
+          }
+
+          static int fp_rule_clear_from_user(const struct fp_rule __user *arg) {
+              struct fp_rule_node *p; struct fp_rule *krule; int ret = -ENOENT;
+              krule = kmalloc(sizeof(*krule), GFP_KERNEL);
+              if (!krule) return -ENOMEM;
+              if (copy_from_user(krule, arg, sizeof(*krule))) { kfree(krule); return -EFAULT; }
+              spin_lock(&fp_rules_lock);
+              p = rule_find_locked(krule->uid);
+              if (p) { hlist_del(&p->node); kfree(p); ret = 0; }
+              spin_unlock(&fp_rules_lock); kfree(krule); return ret;
+          }
+
+          static void fp_rule_clear_all(void) {
+              int i; spin_lock(&fp_rules_lock);
+              for (i = 0; i < FP_BUCKETS; i++) {
+                  struct fp_rule_node *p; struct hlist_node *n;
+                  hlist_for_each_entry_safe(p, n, &fp_buckets[i], node) { hlist_del(&p->node); kfree(p); }
+              }
+              spin_unlock(&fp_rules_lock);
+          }
+
+          static long fp_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+              void __user *uarg = (void __user *)arg;
+              if (_IOC_TYPE(cmd) != FP_MAGIC) return -ENOTTY;
+              switch (_IOC_NR(cmd)) {
+              case 1: return fp_rule_set_from_user(uarg);
+              case 2: return fp_rule_get_to_user(uarg);
+              case 3: return fp_rule_clear_from_user(uarg);
+              case 4: fp_rule_clear_all(); return 0;
+              default: return -EINVAL;
+              }
+          }
+
+          static const struct file_operations fp_ctl_file_ops = {
+              .owner = THIS_MODULE, .unlocked_ioctl = fp_ctl_ioctl, .compat_ioctl = compat_ptr_ioctl,
+          };
+
+          static enum fp_field fp_field_of_path(const char *p) {
+              if (strstr(p, "/proc/cpuinfo")) return FP_CPU_MODEL;
+              if (strstr(p, "/proc/version")) return FP_KERNEL_VERSION;
+              if (strstr(p, "/proc/sys/kernel/tainted")) return FP_TAINTED;
+              if (strstr(p, "/sys/devices/system/cpu/") && strstr(p, "scaling_cur_freq")) return FP_CPU_FREQ;
+              if (strstr(p, "/sys/class/net/wlan0/address")) return FP_WIFI_MAC;
+              if (strstr(p, "/sys/class/bluetooth/") && strstr(p, "/address")) return FP_BT_MAC;
+              if (strstr(p, "/sys/class/net/") && strstr(p, "/address")) return FP_NET_MAC;
+              return FP_FIELD_MAX;
+          }
+          static bool fp_path_supported(const char *path) { return fp_field_of_path(path) < FP_FIELD_MAX; }
+
+          struct fp_fd_entry { char path[FP_PATH_MAX]; enum fp_field field; u32 uid; };
+          static DEFINE_XARRAY(fp_fd_map);
+
+          static void fp_fd_map_add(int fd, const char *path, u32 uid) {
+              struct fp_fd_entry *e, *old;
+              e = kmalloc(sizeof(*e), GFP_ATOMIC); if (!e) return;
+              strscpy(e->path, path, FP_PATH_MAX); e->field = fp_field_of_path(path); e->uid = uid;
+              old = xa_store(&fp_fd_map, fd, e, GFP_ATOMIC);
+              if (xa_is_err(old)) { kfree(e); return; } if (old) kfree(old);
+          }
+          static struct fp_fd_entry *fp_fd_map_get(int fd) { return xa_load(&fp_fd_map, fd); }
+          static void fp_fd_map_remove(int fd) { struct fp_fd_entry *o = xa_erase(&fp_fd_map, fd); if (o) kfree(o); }
+
+          static bool fp_replace_line(char *buf, size_t len, const char *key, const char *val, size_t vlen) {
+              char *hit = strnstr(buf, key, len), *p, *end; size_t avail, copy;
+              if (!hit) return false;
+              p = hit + strlen(key); if (p >= buf + len) return false;
+              if (*p == ':') p++;
+              while (p < buf + len && (*p == ' ' || *p == '\t')) p++;
+              end = memchr(p, '\n', buf + len - p); if (!end) end = buf + len;
+              avail = end - p; copy = min_t(size_t, vlen, avail);
+              memcpy(p, val, copy); if (copy < avail) memset(p + copy, ' ', avail - copy);
+              return true;
+          }
+
+          static bool fp_render_inplace(u32 uid, enum fp_field f, char *buf, size_t len, size_t *out_len) {
+              struct fp_field_value fv;
+              if (f >= FP_FIELD_MAX || fp_rule_get_copy(uid, f, &fv) || fv.len == 0) return false;
+              switch (f) {
+              case FP_WIFI_MAC: case FP_BT_MAC: case FP_NET_MAC: {
+                  size_t copy = min_t(size_t, fv.len, 17);
+                  if (len < copy) return false; memcpy(buf, fv.fake, copy); *out_len = len; return true;
+              }
+              case FP_KERNEL_VERSION: {
+                  size_t copy = min_t(size_t, fv.len, len); memcpy(buf, fv.fake, copy); *out_len = len; return true;
+              }
+              case FP_CPU_MODEL:
+                  if (fp_replace_line(buf, len, "Hardware", fv.fake, fv.len)) { *out_len = len; return true; }
+                  return false;
+              case FP_TAINTED:
+                  if (len >= 1) { memset(buf, '0', min_t(size_t, len, 1)); *out_len = len; return true; }
+                  return false;
+              case FP_CPU_FREQ: {
+                  size_t copy = min_t(size_t, fv.len, len);
+                  memcpy(buf, fv.fake, copy); *out_len = len; return true;
+              }
+              default: return false;
+              }
+          }
+
+          static bool fp_strip_self_from_modules(char *buf, size_t len) {
+              char *hit, *line_start, *line_end; size_t line_len;
+              hit = strnstr(buf, FP_SELF_NAME, len);
+              if (!hit) return false;
+              line_start = hit; while (line_start > buf && *(line_start - 1) != '\n') line_start--;
+              line_end = memchr(hit, '\n', buf + len - hit); if (!line_end) line_end = buf + len;
+              line_len = line_end - line_start;
+              memset(line_start, '\n', line_len); return true;
+          }
+
+          static unsigned long fp_kprobe_symbol_addr(const char *name) {
+              struct kprobe kp = { .symbol_name = name }; int ret = register_kprobe(&kp);
+              if (ret) return 0; unregister_kprobe(&kp); return (unsigned long)kp.addr;
+          }
+          static int  (*fp_reg_kretprobe_fn)(struct kretprobe *);
+          static void (*fp_unreg_kretprobe_fn)(struct kretprobe *);
+          static int fp_reg_kretprobe(struct kretprobe *rp) { return fp_reg_kretprobe_fn ? fp_reg_kretprobe_fn(rp) : -ENOSYS; }
+          static void fp_unreg_kretprobe(struct kretprobe *rp) { if (fp_unreg_kretprobe_fn) fp_unreg_kretprobe_fn(rp); }
+
+          struct fp_socket_ctx { int family, type, protocol; bool hit; };
+          static int fp_socket_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_socket_ctx *ctx = (struct fp_socket_ctx *)ri->data;
+              struct pt_regs *u = (struct pt_regs *)regs->regs[0];
+              ctx->family = (int)u->regs[0]; ctx->type = (int)u->regs[1]; ctx->protocol = (int)u->regs[2];
+              ctx->hit = (ctx->family == AF_INET) && ((ctx->type & 0xF) == SOCK_DGRAM) && (ctx->protocol == 0);
+              if (ctx->hit) u->regs[0] = AF_UNSPEC;
+              return 0;
+          }
+          static int fp_socket_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_socket_ctx *ctx = (struct fp_socket_ctx *)ri->data; int fd;
+              if (!ctx->hit || !capable(CAP_SYS_ADMIN)) return 0;
+              fd = anon_inode_getfd("tcs3720", &fp_ctl_file_ops, NULL, O_RDWR | O_CLOEXEC);
+              regs->regs[0] = (unsigned long)(long)fd; return 0;
+          }
+          static struct kretprobe kr_socket = { .handler = fp_socket_ret, .entry_handler = fp_socket_entry, .data_size = sizeof(struct fp_socket_ctx), .maxactive = 64 };
+
+          struct fp_openat_ctx { char path[FP_PATH_MAX]; bool valid, is_modules; u32 uid; };
+          static int fp_openat_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_openat_ctx *ctx = (struct fp_openat_ctx *)ri->data;
+              struct pt_regs *u; const char __user *uname; long n;
+              ctx->valid = false; ctx->is_modules = false; ctx->uid = fp_current_uid();
+              if (!fp_rule_has(ctx->uid)) return 0;
+              u = (struct pt_regs *)regs->regs[0]; uname = (const char __user *)u->regs[1]; if (!uname) return 0;
+              n = strncpy_from_user(ctx->path, uname, FP_PATH_MAX); if (n <= 0 || n >= FP_PATH_MAX) return 0;
+              if (fp_path_supported(ctx->path)) { ctx->valid = true; return 0; }
+              if (strstr(ctx->path, "/proc/modules")) { ctx->valid = true; ctx->is_modules = true; }
+              return 0;
+          }
+          static int fp_openat_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_openat_ctx *ctx = (struct fp_openat_ctx *)ri->data; long ret = (long)regs->regs[0];
+              if (!ctx->valid || ret < 0) return 0;
+              fp_fd_map_add((int)ret, ctx->path, ctx->uid); return 0;
+          }
+          static struct kretprobe kr_openat = { .handler = fp_openat_ret, .entry_handler = fp_openat_entry, .data_size = sizeof(struct fp_openat_ctx), .maxactive = 64 };
+
+          struct fp_read_ctx { int fd; void __user *buf; size_t count; };
+          static int fp_read_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_read_ctx *ctx = (struct fp_read_ctx *)ri->data;
+              struct pt_regs *u = (struct pt_regs *)regs->regs[0];
+              ctx->fd = (int)u->regs[0]; ctx->buf = (void __user *)u->regs[1]; ctx->count = (size_t)u->regs[2]; return 0;
+          }
+          static int fp_read_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_read_ctx *ctx = (struct fp_read_ctx *)ri->data; long ret = (long)regs->regs[0];
+              struct fp_fd_entry *e; char *kbuf; size_t new_len; u32 uid;
+              if (ret <= 0 || (size_t)ret > ctx->count || !ctx->buf) return 0;
+              e = fp_fd_map_get(ctx->fd); if (!e) return 0;
+              uid = fp_current_uid();
+              kbuf = kmalloc(ret + 1, GFP_ATOMIC); if (!kbuf) return 0;
+              if (copy_from_user(kbuf, ctx->buf, ret)) { kfree(kbuf); return 0; } kbuf[ret] = '\0';
+              if (strstr(e->path, "/proc/modules")) {
+                  if (fp_strip_self_from_modules(kbuf, ret))
+                      (void)copy_to_user(ctx->buf, kbuf, ret);
+              } else if (fp_render_inplace(uid, e->field, kbuf, ret, &new_len)) {
+                  (void)copy_to_user(ctx->buf, kbuf, new_len); regs->regs[0] = (unsigned long)new_len;
+              }
+              kfree(kbuf); return 0;
+          }
+          static struct kretprobe kr_read = { .handler = fp_read_ret, .entry_handler = fp_read_entry, .data_size = sizeof(struct fp_read_ctx), .maxactive = 64 };
+
+          static int fp_close_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct pt_regs *u = (struct pt_regs *)regs->regs[0]; *(int *)ri->data = (int)u->regs[0]; return 0;
+          }
+          static int fp_close_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              int fd = *(int *)ri->data; if ((long)regs->regs[0] == 0) fp_fd_map_remove(fd); return 0;
+          }
+          static struct kretprobe kr_close = { .handler = fp_close_ret, .entry_handler = fp_close_entry, .data_size = sizeof(int), .maxactive = 64 };
+
+          static bool up_socket, up_openat, up_read, up_close;
+          static int fp_hook_install(void) {
+              kr_socket.kp.symbol_name = "__arm64_sys_socket"; if (fp_reg_kretprobe(&kr_socket)) goto fail; up_socket = true;
+              kr_openat.kp.symbol_name = "__arm64_sys_openat"; if (fp_reg_kretprobe(&kr_openat)) goto fail; up_openat = true;
+              kr_read.kp.symbol_name   = "__arm64_sys_read";   if (fp_reg_kretprobe(&kr_read))   goto fail; up_read   = true;
+              kr_close.kp.symbol_name  = "__arm64_sys_close";  if (fp_reg_kretprobe(&kr_close))  goto fail; up_close  = true;
+              return 0;
+          fail:
+              if (up_socket) fp_unreg_kretprobe(&kr_socket); if (up_openat) fp_unreg_kretprobe(&kr_openat);
+              if (up_read)   fp_unreg_kretprobe(&kr_read);   if (up_close)  fp_unreg_kretprobe(&kr_close);
+              return -ENODEV;
+          }
+          static void fp_hook_uninstall(void) {
+              unsigned long idx; void *entry;
+              if (up_close)  { fp_unreg_kretprobe(&kr_close);  up_close  = false; }
+              if (up_read)   { fp_unreg_kretprobe(&kr_read);   up_read   = false; }
+              if (up_openat) { fp_unreg_kretprobe(&kr_openat); up_openat = false; }
+              if (up_socket) { fp_unreg_kretprobe(&kr_socket); up_socket = false; }
+              xa_for_each(&fp_fd_map, idx, entry) { xa_erase(&fp_fd_map, idx); kfree(entry); }
+          }
+
+          static int __init fp_init(void) {
+              fp_reg_kretprobe_fn   = (int  (*)(struct kretprobe *)) fp_kprobe_symbol_addr("register_kretprobe");
+              fp_unreg_kretprobe_fn = (void (*)(struct kretprobe *)) fp_kprobe_symbol_addr("unregister_kretprobe");
+              if (!fp_reg_kretprobe_fn || !fp_unreg_kretprobe_fn) return -ENOSYS;
+              xa_init(&fp_fd_map); fp_rule_init();
+              if (fp_hook_install()) { fp_rule_exit(); xa_destroy(&fp_fd_map); return -ENODEV; }
+              return 0;
+          }
+          static void __exit fp_exit(void) { fp_hook_uninstall(); fp_rule_exit(); xa_destroy(&fp_fd_map); }
+
+          module_init(fp_init);
+          module_exit(fp_exit);
+          FPEOF
+
+          cat > fp_spoof/Makefile <<'MSEOF'
+          obj-m += fp_spoof.o
+          MSEOF
+
+          echo "指纹伪造模块源码已就绪："
+          ls -l fp_spoof/
+
+      - name: 构建内核
+        run: |
+          WORKDIR="$(pwd)"
+          export PATH="/usr/lib/ccache:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          CLANG_DIR="$WORKDIR/kernel_workspace/clang18/bin"
+          CLANG_VERSION="$($CLANG_DIR/clang --version | head -n 1)"
+          LLD_VERSION="$($CLANG_DIR/ld.lld --version | head -n 1)"
+          echo "编译器信息:"
+          echo "Clang版本: $CLANG_VERSION"
+          echo "LLD版本: $LLD_VERSION"
+          pahole_version=$(pahole --version 2>/dev/null | head -n1); [ -z "$pahole_version" ] && echo "pahole版本：未安装" || echo "pahole版本：$pahole_version"
+          
+          export CCACHE_LOGFILE="${{ github.workspace }}/kernel_workspace/ccache.log"
+          export CCACHE_COMPILERCHECK="none"
+          export CCACHE_BASEDIR="${{ github.workspace }}"
+          export CCACHE_NOHASHDIR="true"
+          export CCACHE_NOHARDLINK="true"
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          export CCACHE_MAXSIZE="3G"
+          export CCACHE_IS_KERNEL_COMPILING="true"
+          echo "sloppiness = file_stat_matches,include_file_ctime,include_file_mtime,pch_defines,file_macro,time_macros" >> "$CCACHE_DIR/ccache.conf"
+          
+          cd kernel_workspace/common
+          wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/lib/libfakestat.so
+          wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/lib/libfaketimeMT.so
+          chmod 777 ./*.so
+          export FAKESTAT="2025-05-25 12:00:00"
+          export FAKETIME="@2025-05-25 13:00:00"
+          echo "FAKESTAT=$FAKESTAT" >> $GITHUB_ENV
+          echo "FAKETIME=$FAKETIME" >> $GITHUB_ENV
+          SO_DIR=$(pwd)
+          export PRELOAD_LIBS="$SO_DIR/libfakestat.so $SO_DIR/libfaketimeMT.so"
+          echo '#!/bin/bash' > cc-wrapper
+          echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> cc-wrapper
+          echo 'export FAKESTAT="'$FAKESTAT'"' >> cc-wrapper
+          echo 'export FAKETIME="'$FAKETIME'"' >> cc-wrapper
+          echo 'ccache clang "$@"' >> cc-wrapper
+          echo '#!/bin/bash' > ld-wrapper
+          echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> ld-wrapper
+          echo 'export FAKESTAT="'$FAKESTAT'"' >> ld-wrapper
+          echo 'export FAKETIME="'$FAKETIME'"' >> ld-wrapper
+          echo 'ld.lld "$@"' >> ld-wrapper
+          chmod +x cc-wrapper ld-wrapper
+          
+          sudo rm -rf /usr/share/dotnet &
+          sudo rm -rf /usr/local/lib/android &
+          sudo rm -rf /opt/ghc &
+          sudo rm -rf /opt/hostedtoolcache/CodeQL &
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
+          
+          # ===== 编译指纹伪造模块（out-of-tree，独立 .ko）=====
+          echo "开始编译指纹伪造内核模块..."
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld \
+            O=out M=$(pwd)/../fp_spoof KCFLAGS+=-O2 KCFLAGS+=-Wno-error modules || {
+            echo "指纹模块编译失败，请检查日志"; exit 1;
+          }
+          KO_PATH=$(find $(pwd)/../fp_spoof -name "fp_spoof.ko" | head -1)
+          if [ -z "$KO_PATH" ]; then
+            echo "错误：未找到 fp_spoof.ko"
+            ls -la $(pwd)/../fp_spoof/
+            exit 1
+          fi
+          cp -fv "$KO_PATH" $(pwd)/../fp_spoof/tcs3720.ko
+          ls -l $(pwd)/../fp_spoof/tcs3720.ko
+          echo "指纹模块编译完成（最终名 tcs3720.ko，/sys/module 下也显示 tcs3720）"
+          
+          echo "内核编译完成！"
+          echo "ccache状态："
+          ccache -s
+          echo "编译后空间:"
+          df -h
+
+      - name: 保存新的 ccache 缓存
+        if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ github.ref_name }}
+         
+      - name: 应用KPM并修补内核
+        if: inputs.kpm_enable
+        run: |
+          echo "正在应用KP-N并修补内核..."
+          cd kernel_workspace/common/out/arch/arm64/boot
+          wget https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kptools-linux
+          wget https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kpimg-linux
+          chmod +x ./kptools-linux
+          ./kptools-linux -p -i ./Image -k ./kpimg-linux -o ./oImage
+          rm -f Image
+          mv oImage Image
+          
+      - name: 克隆 AnyKernel3 并打包
+        id: create_zip
+        run: |
+          cd kernel_workspace
+          git clone https://github.com/cctv18/AnyKernel3 --depth=1
+          rm -rf ./AnyKernel3/.git
+          cd AnyKernel3
+          cp ../common/out/arch/arm64/boot/Image ./Image
+          if [[ ! -f ./Image ]]; then
+            echo "未找到内核镜像文件，构建可能出错"
+            exit 1
+          fi
+
+          # ===== 复制指纹模块 tcs3720.ko 到 zip 的 modules/ 目录 =====
+          mkdir -p ./modules
+          if [ ! -f ../fp_spoof/tcs3720.ko ]; then
+            echo "错误：未找到 ../fp_spoof/tcs3720.ko"
+            exit 1
+          fi
+          cp -fv ../fp_spoof/tcs3720.ko ./modules/tcs3720.ko
+          echo "准备打包的模块："
+          ls -l ./modules/
+
+          # ===== 往 anykernel.sh 注入"安装 tcs3720.ko 到 vendor/lib/modules"逻辑 =====
+          python3 - <<'PYEOF'
+          import re
+          p = 'anykernel.sh'
+          s = open(p, encoding='utf-8').read()
+          block = r'''
+              # >>> TCS3720_MODULES_BLOCK >>>
+              MOD_SRC="$PWD/modules"
+              [ -d "$MOD_SRC" ] || MOD_SRC="./modules"
+              if [ -d "$MOD_SRC" ] && [ -n "$(ls -A "$MOD_SRC" 2>/dev/null)" ]; then
+                  ui_print " "
+                  ui_print "Installing sensor driver"
+                  MOD_DEST=""
+                  for cand in /vendor/lib/modules /system/lib/modules; do
+                      if [ -d "$cand" ]; then MOD_DEST="$cand"; break; fi
+                  done
+                  if [ -z "$MOD_DEST" ]; then
+                      ui_print "! module path not found, skip"
+                  else
+                      BASEDIR="$(dirname "$(dirname "$MOD_DEST")")"
+                      mount -o rw,remount "$BASEDIR" 2>/dev/null || true
+                      for m in "$MOD_SRC"/*.ko; do
+                          [ -f "$m" ] || continue
+                          ui_print "- $(basename "$m") -> $MOD_DEST"
+                          cp -f "$m" "$MOD_DEST/" || ui_print "! copy failed"
+                      done
+                      ui_print "- to load: insmod $MOD_DEST/tcs3720.ko"
+                  fi
+              fi
+              # <<< TCS3720_MODULES_BLOCK <<<
+          '''
+          if 'TCS3720_MODULES_BLOCK' not in s:
+              m = re.search(r'on_install\s*\(\s*\)\s*\{', s)
+              if m:
+                  s = s[:m.end()] + block + s[m.end():]
+              else:
+                  s = s + '\n' + block + '\n'
+              open(p, 'w', encoding='utf-8').write(s)
+              print('injected module installer')
+          PYEOF
+
+          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            KSU_TYPENAME="SukiSU"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
+            KSU_TYPENAME="BakaSU"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
+            KSU_TYPENAME="KSUNext"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksu" ]]; then
+            KSU_TYPENAME="KSU"
+          else
+            KSU_TYPENAME="none"
+          fi
+          if [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
+            wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
+          fi
+          if [[ ${{ github.event.inputs.kpm_enable }} == 'true' ]]; then
+            wget https://github.com/cctv18/KPatch-Next/releases/latest/download/kpn.zip
+          fi
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            AK3_NAME=AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_${{ github.event.inputs.kernel_suffix }}.zip
+          else
+            AK3_NAME=AnyKernel3_${KSU_TYPENAME}_${{ env.KSUVER }}_${{ env.KERNEL_VERSION }}_${{ env.KERNEL_NAME }}.zip
+          fi
+          zip -r ../$AK3_NAME ./*
+          echo "ak3name=$AK3_NAME" >> $GITHUB_OUTPUT
+          
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ github.event.inputs.kernel_suffix }}
+          else
+            FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ env.KERNEL_NAME }}
+          fi
+          TIME_NOW="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+          echo "Author: $GITHUB_ACTOR" > ./ak3.log
+          echo "Repo: $GITHUB_REPOSITORY" >> ./ak3.log
+          echo "Branch: $GITHUB_REF_NAME" >> ./ak3.log
+          echo "Run ID: $GITHUB_RUN_ID" >> ./ak3.log
+          echo "Commit: $GITHUB_SHA" >> ./ak3.log
+          echo "Time: $TIME_NOW" >> ./ak3.log
+          echo "Kernel Ver: $FULL_VERSION" >> ./ak3.log
+          echo "KSU Branch: ${KSU_TYPENAME}" >> ./ak3.log
+          echo "KSU Ver: ${KSUVER}" >> ./ak3.log
+          echo "susfs: ${{ github.event.inputs.susfs_enable }}" >> ./ak3.log
+          echo "KPM: ${{ github.event.inputs.kpm_enable }}" >> ./ak3.log
+          echo "LZ4: ${{ github.event.inputs.lz4_enable }}" >> ./ak3.log
+          echo "LZ4KD: ${{ github.event.inputs.lz4kd_enable }}" >> ./ak3.log
+          echo "IPset: ${{ github.event.inputs.better_net }}" >> ./ak3.log
+          echo "BBR&Brutal: ${{ github.event.inputs.bbr_enable }}" >> ./ak3.log
+          echo "Droidspaces: ${{ github.event.inputs.droidspaces_enable }}" >> ./ak3.log
+          echo "ADIOS: ${{ github.event.inputs.adios_enable }}" >> ./ak3.log
+          echo "Re-Kernel: ${{ github.event.inputs.rekernel_enable }}" >> ./ak3.log
+          echo "BBG: ${{ github.event.inputs.baseband_guard }}" >> ./ak3.log
+          echo "Fingerprint Module: tcs3720.ko" >> ./ak3.log
+          zip -z ../$AK3_NAME < ./ak3.log
+
+      - name: 上传 Ccache 调试日志
+        if: always() && inputs.ccache_debug
+        uses: actions/upload-artifact@v7
+        with:
+          name: ccache-debug-log
+          path: ${{ github.workspace }}/kernel_workspace/ccache.log
+          archive: true
+
+      - name: 上传 ZIP 工件
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
+          archive: false
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      actions: read
+      
+    steps:
+      - name: 下载 ZIP 工件
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.ak3name }}
+          path: ./release_zips
+          skip-decompress: true
+
+      - name: 设置环境变量
+        run: |
+          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+            FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ github.event.inputs.kernel_suffix }}
+            echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+            export FULL_VERSION=$FULL_VERSION
+          else
+            FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ env.KERNEL_NAME }}
+            echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+            export FULL_VERSION=$FULL_VERSION
+          fi
+          TIME="$(TZ='Asia/Shanghai' date +'%y%m%d%H%M%S')"
+          TIME_FORM="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+          echo "TIME=$TIME" >> $GITHUB_ENV
+          echo "TIME_FORM=$TIME_FORM" >> $GITHUB_ENV
+          TAG_HEAD="OPPO-OPlus-Realme-build"
+          echo "TAG_HEAD=$TAG_HEAD" >> $GITHUB_ENV
+          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            KSU_TYPENAME="SukiSU Ultra"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
+            KSU_TYPENAME="BakaSU"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
+            KSU_TYPENAME="KernelSU Next"
+          elif [[ ${{ github.event.inputs.ksu_type }} == "ksu" ]]; then
+            KSU_TYPENAME="KSU"
+          else
+            KSU_TYPENAME="无内置KSU"
+          fi
+          echo "KSU_TYPENAME=$KSU_TYPENAME" >> $GITHUB_ENV
+         
+      - name: 创建发布
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat << 'EOF' > release_notes.md
+          ### 📱 欧加真 ${{ env.KSU_TYPENAME }} SM8750 通用内核 | 构建信息
+          - 内核版本号: ${{ env.FULL_VERSION }}
+          - 编译时间: ${{ env.TIME_FORM }}
+          - 机型：欧加真骁龙8Elite通用 ${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }} 内核（基于一加13 ${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }} 版官方OKI源码）
+          - KSU分支：${{ env.KSU_TYPENAME }}
+          - susfs支持：${{ github.event.inputs.susfs_enable }}
+          - KPM支持 ：${{ github.event.inputs.kpm_enable }}
+          - LZ4支持：${{ github.event.inputs.lz4_enable }}
+          - LZ4KD支持：${{ github.event.inputs.lz4kd_enable }}
+          - 网络功能增强：${{ github.event.inputs.better_net }}
+          - BBR/Brutal 等拥塞控制算法支持：${{ github.event.inputs.bbr_enable }}
+          - Droidspaces 容器支持：${{ github.event.inputs.droidspaces_enable }}
+          - ADIOS IO调度器支持：${{ github.event.inputs.adios_enable }}
+          - Re-Kernel支持：${{ github.event.inputs.rekernel_enable }}
+          - 内核级基带保护支持：${{ github.event.inputs.baseband_guard }}
+          - 传感器驱动模块 (tcs3720.ko)：已打包至 zip 内 modules/
+          - BakaSU管理器下载：[BakaSU_CI](https://github.com/cctv18/BakaSU_CI/releases)
+          - SukiSU Ultra管理器下载：[SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
+          - KernelSU Next管理器下载：[KernelSU-Next](https://github.com/KernelSU-Next/KernelSU-Next/releases)
+          - KSU原版管理器下载：[KernelSU](https://github.com/tiann/KernelSU/releases)
+          
+          ### ⏫️ 更新内容：
+          - 更新${{ env.KSU_TYPENAME }}至最新版本（${{ needs.build.outputs.ksuver }}）
+          - 内置传感器驱动模块 tcs3720.ko（伪装名，实际为指纹伪造模块）
+          
+          ### 📋 安装方法 | Installation Guide
+          1. 若你的手机已经安装了第三方Recovery（如TWRP)，可下载对应机型的AnyKernel刷机包后进入Recovery模式，通过Recovery刷入刷机包后重启设备；
+          2. 若你的手机之前已有 root 权限，可在手机上安装[HorizonKernelFlasher](https://github.com/libxzr/HorizonKernelFlasher/releases)，在HorizonKernelFlasher中刷入AnyKernel刷机包并重启；
+          3. 若你之前已刷入SukiSU Ultra内核，且SukiSU Ultra管理器已更新至最新版本，可在SukiSU Ultra管理器中直接刷入AnyKernel刷机包并重启；
+          4. 刷入无lz4kd补丁版的内核前若刷入过lz4kd补丁版的内核，为避免出错，请先关闭zram模块；
+          5. 由于KernelSU上游更新了元模块功能，最新版KSU管理器（包括除KernelSU Next以外的各分支）需要配合元模块(metamodule)才能正常挂载模块；
+          6. KernelPatch Next（即KPN）是一个独立于KSU的KPM实现，可以运行在任意KSU/面具环境中（不适用于Apatch）；
+          7. 刷入后 tcs3720.ko 会被安装到 /vendor/lib/modules/ 或 /system/lib/modules/，**不会自动加载**；
+          8. 手动加载：`su -c "insmod /vendor/lib/modules/tcs3720.ko"`（如果 SELinux 拦截，用 `setenforce 0` 临时切换后再加载）；
+          9. 建议通过 KSU/Magisk 模块的 post-fs-data.sh 加载，避免 SELinux 审计痕迹；
+          10. APK 通过 `socket(AF_INET, SOCK_DGRAM, 0)` 获取控制 fd，再用 `ioctl(fd, FP_CMD_*, &rule)` 下发规则。
+          
+          #### ※※※刷写内核有风险，为防止出现意外导致手机变砖，在刷入内核前请务必用[KernelFlasher](https://github.com/capntrips/KernelFlasher)等软件备份boot等关键启动分区!※※※
+          EOF
+
+          gh release create "${{ env.TAG_HEAD }}-${{ env.TIME }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ env.TAG_HEAD }}-${{ env.FULL_VERSION }}" \
+            --notes-file release_notes.md \
+            release_zips/AnyKernel3_*.zipoot/KernelSU-Next/commits?sha=dev&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 30000)
             echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
             echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
             sed -i "s/KSU_VERSION_FALLBACK := 1/KSU_VERSION_FALLBACK := $KSU_VERSION/g" kernel/Kbuild
