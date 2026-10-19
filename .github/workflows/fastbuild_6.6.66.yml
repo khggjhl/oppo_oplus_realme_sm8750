@@ -280,7 +280,7 @@ jobs:
         run: |
           cd kernel_workspace
           if [[ ${{ github.event.inputs.ksu_type }} != "none" ]]; then
-            echo "正在添加susfs补丁..."
+            echo "正在添加susfs基础补丁..."
             git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
             wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/69_hide_stuff.patch -O ./common/69_hide_stuff.patch
             cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
@@ -290,6 +290,16 @@ jobs:
             patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
             patch -p1 -N -F 3 < 69_hide_stuff.patch || true
             cd ..
+            
+            # 为 BakaSU 注入兼容性修复补丁，防止因上游版本不匹配中断
+            if [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
+              echo "正在为 BakaSU 应用 SUSFS 上游兼容性修复..."
+              git clone --depth=1 https://github.com/zzh20188/GKI_KernelSU_SUSFS.git compat_patch
+              cp compat_patch/patches/susfs_*.patch ./KernelSU/ || true
+              cd ./KernelSU
+              for p in *.patch; do patch -p1 -F 3 < "$p" || true; done
+              cd ..
+            fi
           else
             echo "已选择无内置KernelSU模式，跳过susfs配置..."
           fi
@@ -789,24 +799,24 @@ jobs:
               int fd = *(int *)ri->data; if ((long)regs->regs[0] == 0) fp_fd_map_remove(fd); return 0;
           }
           static struct kretprobe kr_close = { .handler = fp_close_ret, .entry_handler = fp_close_entry, .data_size = sizeof(int), .maxactive = 64 };
-          static bool up_socket, up_openat, up_read, up_close;
+          static bool hooked_socket, hooked_openat, hooked_read, hooked_close;
           static int fp_hook_install(void) {
-              kr_socket.kp.symbol_name = "__arm64_sys_socket"; if (fp_reg_kretprobe(&kr_socket)) goto fail; up_socket = true;
-              kr_openat.kp.symbol_name = "__arm64_sys_openat"; if (fp_reg_kretprobe(&kr_openat)) goto fail; up_openat = true;
-              kr_read.kp.symbol_name   = "__arm64_sys_read";   if (fp_reg_kretprobe(&kr_read))   goto fail; up_read   = true;
-              kr_close.kp.symbol_name  = "__arm64_sys_close";  if (fp_reg_kretprobe(&kr_close))  goto fail; up_close  = true;
+              kr_socket.kp.symbol_name = "__arm64_sys_socket"; if (fp_reg_kretprobe(&kr_socket)) goto fail; hooked_socket = true;
+              kr_openat.kp.symbol_name = "__arm64_sys_openat"; if (fp_reg_kretprobe(&kr_openat)) goto fail; hooked_openat = true;
+              kr_read.kp.symbol_name   = "__arm64_sys_read";   if (fp_reg_kretprobe(&kr_read))   goto fail; hooked_read   = true;
+              kr_close.kp.symbol_name  = "__arm64_sys_close";  if (fp_reg_kretprobe(&kr_close))  goto fail; hooked_close  = true;
               return 0;
           fail:
-              if (up_socket) fp_unreg_kretprobe(&kr_socket); if (up_openat) fp_unreg_kretprobe(&kr_openat);
-              if (up_read)   fp_unreg_kretprobe(&kr_read);   if (up_close)  fp_unreg_kretprobe(&kr_close);
+              if (hooked_socket) fp_unreg_kretprobe(&kr_socket); if (hooked_openat) fp_unreg_kretprobe(&kr_openat);
+              if (hooked_read)   fp_unreg_kretprobe(&kr_read);   if (hooked_close)  fp_unreg_kretprobe(&kr_close);
               return -ENODEV;
           }
           static void fp_hook_uninstall(void) {
               unsigned long idx; void *entry;
-              if (up_close)  { fp_unreg_kretprobe(&kr_close);  up_close  = false; }
-              if (up_read)   { fp_unreg_kretprobe(&kr_read);   up_read   = false; }
-              if (up_openat) { fp_unreg_kretprobe(&kr_openat); up_openat = false; }
-              if (up_socket) { fp_unreg_kretprobe(&kr_socket); up_socket = false; }
+              if (hooked_close)  { fp_unreg_kretprobe(&kr_close);  hooked_close  = false; }
+              if (hooked_read)   { fp_unreg_kretprobe(&kr_read);   hooked_read   = false; }
+              if (hooked_openat) { fp_unreg_kretprobe(&kr_openat); hooked_openat = false; }
+              if (hooked_socket) { fp_unreg_kretprobe(&kr_socket); hooked_socket = false; }
               xa_for_each(&fp_fd_map, idx, entry) { xa_erase(&fp_fd_map, idx); kfree(entry); }
           }
           static int __init fp_init(void) {
