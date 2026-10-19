@@ -893,8 +893,10 @@ jobs:
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error modules
 
           echo "开始编译指纹伪造内核模块..."
+          rm -f ../fp_spoof/Module.symvers
           export KBUILD_MODPOST_WARN=1
-          export KBUILD_EXTRA_SYMBOLS="$(pwd)/out/Module.symvers"
+          export KBUILD_DUPLICATED_EXPORTS_NO_WARN=1
+          
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld \
             O=out M=$(pwd)/../fp_spoof KCFLAGS+=-O2 KCFLAGS+=-Wno-error modules || {
