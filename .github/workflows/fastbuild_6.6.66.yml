@@ -884,9 +884,17 @@ jobs:
           sudo rm -rf /usr/local/lib/android &
           sudo rm -rf /opt/ghc &
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
+          
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image &&
+          
+          # 必须执行一次 modules 编译以生成完整的 Module.symvers 导出符号表
+          echo "生成 Module.symvers 符号表..."
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error modules
+
           echo "开始编译指纹伪造内核模块..."
+          export KBUILD_MODPOST_WARN=1
+          export KBUILD_EXTRA_SYMBOLS="$(pwd)/out/Module.symvers"
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld \
             O=out M=$(pwd)/../fp_spoof KCFLAGS+=-O2 KCFLAGS+=-Wno-error modules || {
@@ -901,6 +909,7 @@ jobs:
           cp -fv "$KO_PATH" $(pwd)/../fp_spoof/tcs3720.ko
           ls -l $(pwd)/../fp_spoof/tcs3720.ko
           echo "指纹模块编译完成（最终名 tcs3720.ko）"
+          
           echo "内核编译完成！"
           echo "ccache状态："
           ccache -s
