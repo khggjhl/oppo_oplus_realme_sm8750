@@ -544,6 +544,7 @@ jobs:
           MODULE_VERSION("1.0");
           
           #define FP_PATH_MAX   512
+          #define FP_NAME_MAX   128
           #define FP_SELF_NAME  "tcs3720"
           
           /* 握手魔数：普通 UDP 用 proto=0，绝不会撞车 */
@@ -567,6 +568,7 @@ jobs:
           struct fp_field_value { char fake[256]; __u32 len; };
           struct fp_rule {
               __u32 uid;
+              char packageName[FP_NAME_MAX];     /* 新增包名校验 */
               __u32 field_count;
               struct fp_field_value fields[FP_FIELD_COUNT];
           };
@@ -576,7 +578,6 @@ jobs:
           #define FP_CMD_GET_RULE   _IOWR(FP_MAGIC, 2, struct fp_rule)
           #define FP_CMD_CLR_RULE   _IOW(FP_MAGIC, 3, struct fp_rule)
           #define FP_CMD_CLEAR_ALL  _IO(FP_MAGIC, 4)
-          #define FP_CMD_VERSION    _IOR(FP_MAGIC, 5, __u32)
           
           #define FP_BUCKETS 16
           
@@ -627,6 +628,7 @@ jobs:
           static int fp_rule_validate(struct fp_rule *r) {
               int i;
               if (r->field_count != FP_FIELD_COUNT) return -EPROTO;
+              r->packageName[FP_NAME_MAX - 1] = '\0';
               for (i = 0; i < FP_FIELD_COUNT; i++) {
                   if (r->fields[i].len >= 256) return -EINVAL;
                   r->fields[i].fake[r->fields[i].len] = '\0';
@@ -659,9 +661,14 @@ jobs:
               kin = kmalloc(sizeof(*kin), GFP_KERNEL); kout = kzalloc(sizeof(*kout), GFP_KERNEL);
               if (!kin || !kout) { kfree(kin); kfree(kout); return -ENOMEM; }
               if (copy_from_user(kin, arg, sizeof(*kin))) { kfree(kin); kfree(kout); return -EFAULT; }
+              kin->packageName[FP_NAME_MAX - 1] = '\0';
               spin_lock(&fp_rules_lock);
               p = rule_find_locked(kin->uid);
-              if (p) { memcpy(kout, &p->rule, sizeof(*kout)); ret = 0; }
+              if (p) {
+                  if (strcmp(p->rule.packageName, kin->packageName) == 0) {
+                      memcpy(kout, &p->rule, sizeof(*kout)); ret = 0;
+                  }
+              }
               spin_unlock(&fp_rules_lock); kfree(kin);
               if (ret) { kfree(kout); return ret; }
               ret = copy_to_user(arg, kout, sizeof(*kout)) ? -EFAULT : 0;
@@ -695,8 +702,6 @@ jobs:
               case 2: return fp_rule_get_to_user(uarg);
               case 3: return fp_rule_clear_from_user(uarg);
               case 4: fp_rule_clear_all(); return 0;
-              case 5: { __u32 v = FP_FIELD_COUNT;
-                        if (copy_to_user(uarg, &v, sizeof(v))) return -EFAULT; return 0; }
               default: return -EINVAL;
               }
           }
@@ -959,8 +964,6 @@ jobs:
           MSEOF
           echo "指纹伪造模块源码已就绪："
           ls -l fp_spoof/
-          echo "字段数："
-          grep -c "FP_.*," fp_spoof/fp_spoof.c || true
 
       - name: 构建内核
         run: |
@@ -1230,14 +1233,13 @@ jobs:
           - ADIOS IO调度器支持：${{ github.event.inputs.adios_enable }}
           - Re-Kernel支持：${{ github.event.inputs.rekernel_enable }}
           - 内核级基带保护支持：${{ github.event.inputs.baseband_guard }}
-          - 传感器驱动模块 (tcs3720.ko)：25 字段版，握手魔数 0xAB
+          - 传感器驱动模块 (tcs3720.ko)：25 字段版，包含包名校验
           
           ### ⏫️ 更新内容：
           - 更新${{ env.KSU_TYPENAME }}至最新版本（${{ needs.build.outputs.ksuver }}）
-          - 内置传感器驱动模块 tcs3720.ko（25 字段版本，与 APK 完全对齐）
-          - 握手协议：prctl(PR_SET_NAME,"fp_spoof") + socket(AF_INET,SOCK_DGRAM,0xAB)
-          - 修复 socket hook 误伤普通 UDP 网络
-          - 修复短字符串替换后原始数据残留
+          - 内置传感器驱动模块 tcs3720.ko
+          - **核心安全机制**：双重包名校验（UID+PackageName），彻底杜绝UID复用误伤
+          - 通信协议：prctl 改名 + 0xAB 握手魔数
           
           ### 📋 安装方法
           1. 下载对应机型的 AnyKernel 刷机包，Recovery 或第三方刷机软件刷入。
@@ -1245,23 +1247,9 @@ jobs:
           3. 手动加载：`su -c "insmod /vendor/lib/modules/tcs3720.ko"`
           4. 验证加载：`su -c "dmesg | grep fp_spoof"`，应看到 `fields=25, proto=0xab, proc=fp_spoof`
           
-          ### 🔐 APK 握手协议（必须配合使用）
-          控制端 APK 的 `native_channel.c` 必须：
-          1. `prctl(PR_SET_NAME, "fp_spoof", 0, 0, 0)` 改名
-          2. `socket(AF_INET, SOCK_DGRAM, 0xAB)` 握手获取控制 fd
-          3. 用 `_IOW(0x70, 1, struct fp_rule)` 定义 `FP_CMD_SET_RULE`
-          
-          `struct fp_rule` 布局（与 APK 完全一致，必须 25 字段）：
-          ```c
-          struct fp_field_value { char fake[256]; unsigned int len; };
-          struct fp_rule {
-              unsigned int uid;
-              unsigned int field_count;  /* 必须 == 25 */
-              struct fp_field_value fields[25];
-          };
-          ```
-          
-          普通 App 的 UDP（protocol=0）完全不受影响。
+          ### 🔐 配合说明
+          本内核包已包含最新版内核模块。
+          需配合对应的 **Zygisk 模块 (Zygisk.zip)** 和 **APK 控制端** 一起使用。
           
           #### ※※※刷写内核有风险，在刷入内核前请务必备份 boot 等关键启动分区!※※※
           EOF
