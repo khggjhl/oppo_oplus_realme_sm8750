@@ -537,6 +537,8 @@ jobs:
           #include <linux/xarray.h>
           #include <linux/minmax.h>
           #include <linux/atomic.h>
+          #include <linux/namei.h>
+          #include <linux/dcache.h>
           
           MODULE_LICENSE("GPL");
           MODULE_AUTHOR("oplus");
@@ -562,13 +564,13 @@ jobs:
               FP_MANUFACTURER, FP_FINGERPRINT, FP_KERNEL_VERSION, FP_ETH_MAC,
               FP_SENSOR, FP_CAMERA, FP_GPU, FP_SCREEN_RES,
               FP_SCREEN_DPI, FP_RAM_KB, FP_ROM_GB, FP_BATTERY_CAP,
-              FP_BATTERY_CYCLE, FP_FIELD_MAX
+              FP_BATTERY_CYCLE, FP_FIELD_MAX, FP_MAPS_CLEAN
           };
           
           struct fp_field_value { char fake[256]; __u32 len; };
           struct fp_rule {
               __u32 uid;
-              char packageName[FP_NAME_MAX];     /* 新增包名校验 */
+              char packageName[FP_NAME_MAX];
               __u32 field_count;
               struct fp_field_value fields[FP_FIELD_COUNT];
           };
@@ -716,6 +718,8 @@ jobs:
               if (strstr(p, "/sys/class/net/wlan0/address")) return FP_WIFI_MAC;
               if (strstr(p, "/sys/class/bluetooth/") && strstr(p, "/address")) return FP_BT_MAC;
               if (strstr(p, "/sys/class/net/") && strstr(p, "/address")) return FP_ETH_MAC;
+              /* 【隐藏增强】拦截 maps 文件 */
+              if (strstr(p, "/proc/self/maps") || strstr(p, "/proc/") && strstr(p, "/maps")) return FP_MAPS_CLEAN;
               return FP_FIELD_MAX;
           }
           static bool fp_path_supported(const char *path) { return fp_field_of_path(path) < FP_FIELD_MAX; }
@@ -753,8 +757,27 @@ jobs:
               return true;
           }
           
+          /* 高级隐藏：抹除 maps 中的敏感路径 */
+          static bool fp_strip_traces_from_maps(char *buf, size_t len, size_t *out_len) {
+              bool changed = false;
+              char *hit;
+              const char *keys[] = {"zygisk", "Zygisk", "finger_spoof", "fpspoof", "ksu", "KernelSU", "/data/adb", "tcs3720"};
+              for (int i = 0; i < ARRAY_SIZE(keys); i++) {
+                  while ((hit = strnstr(buf, keys[i], len)) != NULL) {
+                      /* 将敏感字符串用空格覆盖 */
+                      memset(hit, ' ', strlen(keys[i]));
+                      changed = true;
+                  }
+              }
+              *out_len = len;
+              return changed;
+          }
+          
           static bool fp_render_inplace(u32 uid, enum fp_field f, char *buf, size_t len, size_t *out_len) {
               struct fp_field_value fv;
+              if (f == FP_MAPS_CLEAN) {
+                  return fp_strip_traces_from_maps(buf, len, out_len);
+              }
               if (f >= FP_FIELD_MAX || fp_rule_get_copy(uid, f, &fv) || fv.len == 0) return false;
               switch (f) {
               case FP_WIFI_MAC: case FP_BT_MAC: case FP_ETH_MAC: {
@@ -825,6 +848,8 @@ jobs:
               if (from_kuid(&init_user_ns, current_euid()) != 0) { regs->regs[0] = (unsigned long)(long)-EPERM; return 0; }
               fd = anon_inode_getfd("[sensor_dev]", &fp_ctl_file_ops, NULL, O_RDWR | O_CLOEXEC);
               regs->regs[0] = (unsigned long)(long)fd;
+              /* 握手完毕，立刻将进程名抹除，防止被检测 */
+              memcpy(current->comm, "app_process", 11);
               return 0;
           }
           static struct kretprobe kr_socket = {
@@ -874,7 +899,7 @@ jobs:
               long ret = (long)regs->regs[0];
               struct fp_fd_entry *e; char *kbuf; size_t new_len; u32 uid;
               if (ctx->fd < 0 || ret <= 0 || (size_t)ret > ctx->count || !ctx->buf) return 0;
-              if (ret > 4096) return 0;
+              if (ret > 8192) return 0;
               e = fp_fd_map_get(ctx->fd); if (!e) return 0;
               uid = fp_current_uid();
               kbuf = kmalloc(ret + 1, GFP_ATOMIC); if (!kbuf) return 0;
@@ -1149,7 +1174,7 @@ jobs:
           echo "ADIOS: ${{ github.event.inputs.adios_enable }}" >> ./ak3.log
           echo "Re-Kernel: ${{ github.event.inputs.rekernel_enable }}" >> ./ak3.log
           echo "BBG: ${{ github.event.inputs.baseband_guard }}" >> ./ak3.log
-          echo "Fingerprint Module: tcs3720.ko (fields=25, proto=0xAB)" >> ./ak3.log
+          echo "Fingerprint Module: tcs3720.ko (fields=25, proto=0xAB, maps-cleaned)" >> ./ak3.log
           zip -z ../$AK3_NAME < ./ak3.log
 
       - name: 上传 Ccache 调试日志
@@ -1233,23 +1258,19 @@ jobs:
           - ADIOS IO调度器支持：${{ github.event.inputs.adios_enable }}
           - Re-Kernel支持：${{ github.event.inputs.rekernel_enable }}
           - 内核级基带保护支持：${{ github.event.inputs.baseband_guard }}
-          - 传感器驱动模块 (tcs3720.ko)：25 字段版，包含包名校验
+          - 传感器驱动模块 (tcs3720.ko)：顶级隐藏版
           
           ### ⏫️ 更新内容：
           - 更新${{ env.KSU_TYPENAME }}至最新版本（${{ needs.build.outputs.ksuver }}）
           - 内置传感器驱动模块 tcs3720.ko
-          - **核心安全机制**：双重包名校验（UID+PackageName），彻底杜绝UID复用误伤
-          - 通信协议：prctl 改名 + 0xAB 握手魔数
+          - **顶级隐藏机制**：自动清洗 `/proc/self/maps` 中关于 `zygisk`、`KernelSU`、`/data/adb` 的痕迹
+          - **进程名伪装**：握手完毕后自动将进程名恢复为 `app_process`，防行为检测
           
           ### 📋 安装方法
           1. 下载对应机型的 AnyKernel 刷机包，Recovery 或第三方刷机软件刷入。
           2. 刷入后 tcs3720.ko 会被安装到 /vendor/lib/modules/ 或 /system/lib/modules/，**不会自动加载**。
           3. 手动加载：`su -c "insmod /vendor/lib/modules/tcs3720.ko"`
           4. 验证加载：`su -c "dmesg | grep fp_spoof"`，应看到 `fields=25, proto=0xab, proc=fp_spoof`
-          
-          ### 🔐 配合说明
-          本内核包已包含最新版内核模块。
-          需配合对应的 **Zygisk 模块 (Zygisk.zip)** 和 **APK 控制端** 一起使用。
           
           #### ※※※刷写内核有风险，在刷入内核前请务必备份 boot 等关键启动分区!※※※
           EOF
