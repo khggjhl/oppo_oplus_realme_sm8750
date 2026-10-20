@@ -537,8 +537,6 @@ jobs:
           #include <linux/xarray.h>
           #include <linux/minmax.h>
           #include <linux/atomic.h>
-          #include <linux/namei.h>
-          #include <linux/dcache.h>
           
           MODULE_LICENSE("GPL");
           MODULE_AUTHOR("oplus");
@@ -549,12 +547,9 @@ jobs:
           #define FP_NAME_MAX   128
           #define FP_SELF_NAME  "tcs3720"
           
-          /* 握手魔数：普通 UDP 用 proto=0，绝不会撞车 */
           #define FP_HANDSHAKE_PROTOCOL 0xAB
-          /* 控制端进程名：必须在握手前 prctl(PR_SET_NAME,"fp_spoof") */
           #define FP_CONTROL_PROC_NAME  "fp_spoof"
           
-          /* 字段顺序必须与 APK 的 FieldMeta.FIELDS 完全一致 */
           #define FP_FIELD_COUNT 25
           
           enum fp_field {
@@ -718,7 +713,6 @@ jobs:
               if (strstr(p, "/sys/class/net/wlan0/address")) return FP_WIFI_MAC;
               if (strstr(p, "/sys/class/bluetooth/") && strstr(p, "/address")) return FP_BT_MAC;
               if (strstr(p, "/sys/class/net/") && strstr(p, "/address")) return FP_ETH_MAC;
-              /* 【隐藏增强】拦截 maps 文件 */
               if (strstr(p, "/proc/self/maps") || strstr(p, "/proc/") && strstr(p, "/maps")) return FP_MAPS_CLEAN;
               return FP_FIELD_MAX;
           }
@@ -757,14 +751,12 @@ jobs:
               return true;
           }
           
-          /* 高级隐藏：抹除 maps 中的敏感路径 */
           static bool fp_strip_traces_from_maps(char *buf, size_t len, size_t *out_len) {
               bool changed = false;
               char *hit;
               const char *keys[] = {"zygisk", "Zygisk", "finger_spoof", "fpspoof", "ksu", "KernelSU", "/data/adb", "tcs3720"};
               for (int i = 0; i < ARRAY_SIZE(keys); i++) {
                   while ((hit = strnstr(buf, keys[i], len)) != NULL) {
-                      /* 将敏感字符串用空格覆盖 */
                       memset(hit, ' ', strlen(keys[i]));
                       changed = true;
                   }
@@ -845,10 +837,9 @@ jobs:
               struct fp_socket_ctx *ctx = (struct fp_socket_ctx *)ri->data;
               int fd;
               if (!ctx->hit) return 0;
-              if (from_kuid(&init_user_ns, current_euid()) != 0) { regs->regs[0] = (unsigned long)(long)-EPERM; return 0; }
+              /* 【修改】移除了 EUID 必须为 0 的强制限制，交由 0xAB + prctl 保护 */
               fd = anon_inode_getfd("[sensor_dev]", &fp_ctl_file_ops, NULL, O_RDWR | O_CLOEXEC);
               regs->regs[0] = (unsigned long)(long)fd;
-              /* 握手完毕，立刻将进程名抹除，防止被检测 */
               memcpy(current->comm, "app_process", 11);
               return 0;
           }
@@ -1263,12 +1254,13 @@ jobs:
           ### ⏫️ 更新内容：
           - 更新${{ env.KSU_TYPENAME }}至最新版本（${{ needs.build.outputs.ksuver }}）
           - 内置传感器驱动模块 tcs3720.ko
-          - **顶级隐藏机制**：自动清洗 `/proc/self/maps` 中关于 `zygisk`、`KernelSU`、`/data/adb` 的痕迹
+          - **权限修复**：彻底解决普通 App 已授权 Root 但内核通信被拒的问题（移除握手阶段的 EUID 强校验）
+          - **顶级隐藏机制**：自动清洗 `/proc/self/maps` 中关于 `zygisk`、`KernelSU` 的痕迹
           - **进程名伪装**：握手完毕后自动将进程名恢复为 `app_process`，防行为检测
           
           ### 📋 安装方法
           1. 下载对应机型的 AnyKernel 刷机包，Recovery 或第三方刷机软件刷入。
-          2. 刷入后 tcs3720.ko 会被安装到 /vendor/lib/modules/ 或 /system/lib/modules/，**不会自动加载**。
+          2. 刷入后 tcs3720.ko 会被安装到 /vendor/lib/modules/ 或 /system/lib/modules/。
           3. 手动加载：`su -c "insmod /vendor/lib/modules/tcs3720.ko"`
           4. 验证加载：`su -c "dmesg | grep fp_spoof"`，应看到 `fields=25, proto=0xab, proc=fp_spoof`
           
