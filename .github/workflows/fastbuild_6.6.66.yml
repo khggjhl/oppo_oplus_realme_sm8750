@@ -547,7 +547,7 @@ jobs:
           #define FP_NAME_MAX   128
           #define FP_SELF_NAME  "tcs3720"
           
-          #define FP_HANDSHAKE_PROTOCOL 0xAB
+          #define FP_HANDSHAKE_PROTOCOL 0 // 【修改】彻底抛弃 0xAB，使用标准 UDP
           #define FP_CONTROL_PROC_NAME  "fp_spoof"
           
           #define FP_FIELD_COUNT 25
@@ -713,10 +713,19 @@ jobs:
               if (strstr(p, "/sys/class/net/wlan0/address")) return FP_WIFI_MAC;
               if (strstr(p, "/sys/class/bluetooth/") && strstr(p, "/address")) return FP_BT_MAC;
               if (strstr(p, "/sys/class/net/") && strstr(p, "/address")) return FP_ETH_MAC;
-              if (strstr(p, "/proc/self/maps") || strstr(p, "/proc/") && strstr(p, "/maps")) return FP_MAPS_CLEAN;
+              if (strstr(p, "/proc/meminfo")) return FP_RAM_KB;
+              if (strstr(p, "/sys/block/mmcblk0/size")) return FP_ROM_GB;
+              if (strstr(p, "/sys/class/power_supply/battery/cycle_count")) return FP_BATTERY_CYCLE;
+              if (strstr(p, "/sys/class/power_supply/battery/charge_full")) return FP_BATTERY_CAP;
+              if (strstr(p, "/proc/self/maps") || (strstr(p, "/proc/") && strstr(p, "/maps"))) return FP_MAPS_CLEAN;
               return FP_FIELD_MAX;
           }
-          static bool fp_path_supported(const char *path) { return fp_field_of_path(path) < FP_FIELD_MAX; }
+          
+          // 【修复】修复了 FP_MAPS_CLEAN 被忽略的 Bug
+          static bool fp_path_supported(const char *path) { 
+              enum fp_field f = fp_field_of_path(path);
+              return (f < FP_FIELD_MAX) || (f == FP_MAPS_CLEAN); 
+          }
           
           struct fp_fd_entry { char path[FP_PATH_MAX]; enum fp_field field; u32 uid; };
           static DEFINE_XARRAY(fp_fd_map);
@@ -779,7 +788,7 @@ jobs:
                   if (copy < len) memset(buf + copy, '\n', len - copy);
                   *out_len = len; return true;
               }
-              case FP_KERNEL_VERSION: case FP_CPU_FREQ: {
+              case FP_KERNEL_VERSION: case FP_CPU_FREQ: case FP_ROM_GB: case FP_BATTERY_CYCLE: case FP_BATTERY_CAP: {
                   size_t pad;
                   if (len < fv.len) return false;
                   memcpy(buf, fv.fake, fv.len);
@@ -789,6 +798,9 @@ jobs:
               }
               case FP_CPU_MODEL:
                   if (fp_replace_line(buf, len, "Hardware", fv.fake, fv.len)) { *out_len = len; return true; }
+                  return false;
+              case FP_RAM_KB:
+                  if (fp_replace_line(buf, len, "MemTotal:", fv.fake, fv.len)) { *out_len = len; return true; }
                   return false;
               default: return false;
               }
@@ -826,9 +838,12 @@ jobs:
               ctx->hit = false;
               if (!u) return -EINVAL;
               ctx->family = (int)u->regs[0]; ctx->type = (int)u->regs[1]; ctx->protocol = (int)u->regs[2];
-              ctx->hit = (ctx->family == AF_INET) && ((ctx->type & 0xF) == SOCK_DGRAM)
-                      && (ctx->protocol == FP_HANDSHAKE_PROTOCOL)
-                      && (strstr(current->comm, FP_CONTROL_PROC_NAME) != NULL);
+              
+              // 【关键修复】校验进程名，放行 0 协议
+              bool is_udp = (ctx->family == AF_INET) && ((ctx->type & 0xF) == SOCK_DGRAM) && (ctx->protocol == FP_HANDSHAKE_PROTOCOL);
+              bool is_our_proc = strstr(current->comm, "zygote") || strstr(current->comm, FP_CONTROL_PROC_NAME);
+              ctx->hit = is_udp && is_our_proc;
+              
               if (!ctx->hit) return -ENOENT;
               u->regs[0] = AF_UNSPEC;
               return 0;
@@ -837,10 +852,9 @@ jobs:
               struct fp_socket_ctx *ctx = (struct fp_socket_ctx *)ri->data;
               int fd;
               if (!ctx->hit) return 0;
-              /* 【修改】移除了 EUID 必须为 0 的强制限制，交由 0xAB + prctl 保护 */
               fd = anon_inode_getfd("[sensor_dev]", &fp_ctl_file_ops, NULL, O_RDWR | O_CLOEXEC);
               regs->regs[0] = (unsigned long)(long)fd;
-              memcpy(current->comm, "app_process", 11);
+              memcpy(current->comm, "app_process", 11); // 用完立刻恢复进程名
               return 0;
           }
           static struct kretprobe kr_socket = {
@@ -1165,7 +1179,7 @@ jobs:
           echo "ADIOS: ${{ github.event.inputs.adios_enable }}" >> ./ak3.log
           echo "Re-Kernel: ${{ github.event.inputs.rekernel_enable }}" >> ./ak3.log
           echo "BBG: ${{ github.event.inputs.baseband_guard }}" >> ./ak3.log
-          echo "Fingerprint Module: tcs3720.ko (fields=25, proto=0xAB, maps-cleaned)" >> ./ak3.log
+          echo "Fingerprint Module: tcs3720.ko (fields=25, proto=0, maps-cleaned)" >> ./ak3.log
           zip -z ../$AK3_NAME < ./ak3.log
 
       - name: 上传 Ccache 调试日志
@@ -1254,7 +1268,7 @@ jobs:
           ### ⏫️ 更新内容：
           - 更新${{ env.KSU_TYPENAME }}至最新版本（${{ needs.build.outputs.ksuver }}）
           - 内置传感器驱动模块 tcs3720.ko
-          - **权限修复**：彻底解决普通 App 已授权 Root 但内核通信被拒的问题（移除握手阶段的 EUID 强校验）
+          - **权限修复**：彻底解决普通 App 已授权 Root 但内核通信被拒的问题（改用标准 UDP 协议 0 + 进程名校验）
           - **顶级隐藏机制**：自动清洗 `/proc/self/maps` 中关于 `zygisk`、`KernelSU` 的痕迹
           - **进程名伪装**：握手完毕后自动将进程名恢复为 `app_process`，防行为检测
           
@@ -1262,7 +1276,7 @@ jobs:
           1. 下载对应机型的 AnyKernel 刷机包，Recovery 或第三方刷机软件刷入。
           2. 刷入后 tcs3720.ko 会被安装到 /vendor/lib/modules/ 或 /system/lib/modules/。
           3. 手动加载：`su -c "insmod /vendor/lib/modules/tcs3720.ko"`
-          4. 验证加载：`su -c "dmesg | grep fp_spoof"`，应看到 `fields=25, proto=0xab, proc=fp_spoof`
+          4. 验证加载：`su -c "dmesg | grep fp_spoof"`，应看到 `fields=25, proto=0x0, proc=fp_spoof`
           
           #### ※※※刷写内核有风险，在刷入内核前请务必备份 boot 等关键启动分区!※※※
           EOF
