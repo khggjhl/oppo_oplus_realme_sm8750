@@ -516,447 +516,447 @@ jobs:
           cd kernel_workspace
           mkdir -p fp_spoof
           cat > fp_spoof/fp_spoof.c <<'FPEOF'
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/kprobes.h>
-#include <linux/uaccess.h>
-#include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/spinlock.h>
-#include <linux/jhash.h>
-#include <linux/sched.h>
-#include <linux/cred.h>
-#include <linux/capability.h>
-#include <linux/fs.h>
-#include <linux/file.h>
-#include <linux/anon_inodes.h>
-#include <linux/net.h>
-#include <linux/if.h>
-#include <linux/in.h>
-#include <linux/netdevice.h>
-#include <linux/xarray.h>
-#include <linux/minmax.h>
-#include <linux/atomic.h>
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("oplus");
-MODULE_DESCRIPTION("OPLUS ALSPS Sensor Driver");
-MODULE_VERSION("1.0");
-
-#define FP_PATH_MAX   512
-#define FP_SELF_NAME  "tcs3720"
-
-/* 握手魔数：普通 UDP 用 proto=0，绝不会撞车 */
-#define FP_HANDSHAKE_PROTOCOL 0xAB
-/* 控制端进程名：必须在握手前 prctl(PR_SET_NAME,"fp_spoof") */
-#define FP_CONTROL_PROC_NAME  "fp_spoof"
-
-/* 字段顺序必须与 APK 的 FieldMeta.FIELDS 完全一致 */
-#define FP_FIELD_COUNT 25
-
-enum fp_field {
-    FP_SERIAL = 0, FP_ANDROID_ID, FP_IMEI, FP_MEID,
-    FP_WIFI_MAC, FP_BT_MAC, FP_BOARD, FP_CPU_MODEL,
-    FP_CPU_FREQ, FP_CPU_CORES, FP_BRAND, FP_MODEL,
-    FP_MANUFACTURER, FP_FINGERPRINT, FP_KERNEL_VERSION, FP_ETH_MAC,
-    FP_SENSOR, FP_CAMERA, FP_GPU, FP_SCREEN_RES,
-    FP_SCREEN_DPI, FP_RAM_KB, FP_ROM_GB, FP_BATTERY_CAP,
-    FP_BATTERY_CYCLE, FP_FIELD_MAX
-};
-
-struct fp_field_value { char fake[256]; __u32 len; };
-struct fp_rule {
-    __u32 uid;
-    __u32 field_count;
-    struct fp_field_value fields[FP_FIELD_COUNT];
-};
-
-#define FP_MAGIC          0x70
-#define FP_CMD_SET_RULE   _IOW(FP_MAGIC, 1, struct fp_rule)
-#define FP_CMD_GET_RULE   _IOWR(FP_MAGIC, 2, struct fp_rule)
-#define FP_CMD_CLR_RULE   _IOW(FP_MAGIC, 3, struct fp_rule)
-#define FP_CMD_CLEAR_ALL  _IO(FP_MAGIC, 4)
-#define FP_CMD_VERSION    _IOR(FP_MAGIC, 5, __u32)
-
-#define FP_BUCKETS 16
-
-struct fp_rule_node { struct fp_rule rule; struct hlist_node node; };
-
-static struct hlist_head fp_buckets[FP_BUCKETS];
-static DEFINE_SPINLOCK(fp_rules_lock);
-static atomic_t fp_active_count = ATOMIC_INIT(0);
-
-static inline u32 fp_hash_uid(u32 uid) { return jhash_1word(uid, 0x71ABC) & (FP_BUCKETS - 1); }
-static u32 fp_current_uid(void) { return from_kuid(&init_user_ns, current_uid()); }
-
-static struct fp_rule_node *rule_find_locked(u32 uid) {
-    struct fp_rule_node *p;
-    hlist_for_each_entry(p, &fp_buckets[fp_hash_uid(uid)], node)
-        if (p->rule.uid == uid) return p;
-    return NULL;
-}
-
-static void fp_rule_init(void) { int i; for (i = 0; i < FP_BUCKETS; i++) INIT_HLIST_HEAD(&fp_buckets[i]); }
-static void fp_rule_exit(void) {
-    int i; spin_lock(&fp_rules_lock);
-    for (i = 0; i < FP_BUCKETS; i++) {
-        struct fp_rule_node *p; struct hlist_node *n;
-        hlist_for_each_entry_safe(p, n, &fp_buckets[i], node) { hlist_del(&p->node); kfree(p); }
-    }
-    atomic_set(&fp_active_count, 0);
-    spin_unlock(&fp_rules_lock);
-}
-static bool fp_rule_has(u32 uid) {
-    bool hit;
-    if (atomic_read(&fp_active_count) == 0) return false;
-    spin_lock(&fp_rules_lock);
-    hit = rule_find_locked(uid) != NULL;
-    spin_unlock(&fp_rules_lock);
-    return hit;
-}
-static int fp_rule_get_copy(u32 uid, enum fp_field f, struct fp_field_value *out) {
-    struct fp_rule_node *p; int ret = -ENOENT;
-    if (!out || (int)f < 0 || f >= FP_FIELD_COUNT) return -EINVAL;
-    spin_lock(&fp_rules_lock);
-    p = rule_find_locked(uid);
-    if (p) { memcpy(out, &p->rule.fields[f], sizeof(*out)); ret = 0; }
-    spin_unlock(&fp_rules_lock);
-    return ret;
-}
-
-static int fp_rule_validate(struct fp_rule *r) {
-    int i;
-    if (r->field_count != FP_FIELD_COUNT) return -EPROTO;
-    for (i = 0; i < FP_FIELD_COUNT; i++) {
-        if (r->fields[i].len >= 256) return -EINVAL;
-        r->fields[i].fake[r->fields[i].len] = '\0';
-    }
-    return 0;
-}
-static int fp_rule_set_from_user(const struct fp_rule __user *arg) {
-    struct fp_rule *krule; struct fp_rule_node *p; int ret;
-    krule = kzalloc(sizeof(*krule), GFP_KERNEL);
-    if (!krule) return -ENOMEM;
-    if (copy_from_user(krule, arg, sizeof(*krule))) { kfree(krule); return -EFAULT; }
-    ret = fp_rule_validate(krule);
-    if (ret) { kfree(krule); return ret; }
-    spin_lock(&fp_rules_lock);
-    p = rule_find_locked(krule->uid);
-    if (p) { memcpy(&p->rule, krule, sizeof(p->rule)); spin_unlock(&fp_rules_lock); kfree(krule); return 0; }
-    spin_unlock(&fp_rules_lock);
-    p = kzalloc(sizeof(*p), GFP_KERNEL);
-    if (!p) { kfree(krule); return -ENOMEM; }
-    memcpy(&p->rule, krule, sizeof(p->rule));
-    INIT_HLIST_NODE(&p->node);
-    spin_lock(&fp_rules_lock);
-    if (rule_find_locked(krule->uid)) { spin_unlock(&fp_rules_lock); kfree(p); kfree(krule); return 0; }
-    hlist_add_head(&p->node, &fp_buckets[fp_hash_uid(krule->uid)]);
-    atomic_inc(&fp_active_count);
-    spin_unlock(&fp_rules_lock); kfree(krule); return 0;
-}
-static int fp_rule_get_to_user(struct fp_rule __user *arg) {
-    struct fp_rule_node *p; struct fp_rule *kin, *kout; int ret = -ENOENT;
-    kin = kmalloc(sizeof(*kin), GFP_KERNEL); kout = kzalloc(sizeof(*kout), GFP_KERNEL);
-    if (!kin || !kout) { kfree(kin); kfree(kout); return -ENOMEM; }
-    if (copy_from_user(kin, arg, sizeof(*kin))) { kfree(kin); kfree(kout); return -EFAULT; }
-    spin_lock(&fp_rules_lock);
-    p = rule_find_locked(kin->uid);
-    if (p) { memcpy(kout, &p->rule, sizeof(*kout)); ret = 0; }
-    spin_unlock(&fp_rules_lock); kfree(kin);
-    if (ret) { kfree(kout); return ret; }
-    ret = copy_to_user(arg, kout, sizeof(*kout)) ? -EFAULT : 0;
-    kfree(kout); return ret;
-}
-static int fp_rule_clear_from_user(const struct fp_rule __user *arg) {
-    struct fp_rule_node *p; struct fp_rule *krule; int ret = -ENOENT;
-    krule = kmalloc(sizeof(*krule), GFP_KERNEL);
-    if (!krule) return -ENOMEM;
-    if (copy_from_user(krule, arg, sizeof(*krule))) { kfree(krule); return -EFAULT; }
-    spin_lock(&fp_rules_lock);
-    p = rule_find_locked(krule->uid);
-    if (p) { hlist_del(&p->node); kfree(p); atomic_dec(&fp_active_count); ret = 0; }
-    spin_unlock(&fp_rules_lock); kfree(krule); return ret;
-}
-static void fp_rule_clear_all(void) {
-    int i; spin_lock(&fp_rules_lock);
-    for (i = 0; i < FP_BUCKETS; i++) {
-        struct fp_rule_node *p; struct hlist_node *n;
-        hlist_for_each_entry_safe(p, n, &fp_buckets[i], node) { hlist_del(&p->node); kfree(p); }
-    }
-    atomic_set(&fp_active_count, 0);
-    spin_unlock(&fp_rules_lock);
-}
-
-static long fp_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
-    void __user *uarg = (void __user *)arg;
-    if (_IOC_TYPE(cmd) != FP_MAGIC) return -ENOTTY;
-    switch (_IOC_NR(cmd)) {
-    case 1: return fp_rule_set_from_user(uarg);
-    case 2: return fp_rule_get_to_user(uarg);
-    case 3: return fp_rule_clear_from_user(uarg);
-    case 4: fp_rule_clear_all(); return 0;
-    case 5: { __u32 v = FP_FIELD_COUNT;
-              if (copy_to_user(uarg, &v, sizeof(v))) return -EFAULT; return 0; }
-    default: return -EINVAL;
-    }
-}
-static const struct file_operations fp_ctl_file_ops = {
-    .owner = THIS_MODULE, .unlocked_ioctl = fp_ctl_ioctl, .compat_ioctl = compat_ptr_ioctl,
-};
-
-static enum fp_field fp_field_of_path(const char *p) {
-    if (strstr(p, "/proc/cpuinfo")) return FP_CPU_MODEL;
-    if (strstr(p, "/proc/version")) return FP_KERNEL_VERSION;
-    if (strstr(p, "/sys/devices/system/cpu/") && strstr(p, "scaling_cur_freq")) return FP_CPU_FREQ;
-    if (strstr(p, "/sys/class/net/wlan0/address")) return FP_WIFI_MAC;
-    if (strstr(p, "/sys/class/bluetooth/") && strstr(p, "/address")) return FP_BT_MAC;
-    if (strstr(p, "/sys/class/net/") && strstr(p, "/address")) return FP_ETH_MAC;
-    return FP_FIELD_MAX;
-}
-static bool fp_path_supported(const char *path) { return fp_field_of_path(path) < FP_FIELD_MAX; }
-
-struct fp_fd_entry { char path[FP_PATH_MAX]; enum fp_field field; u32 uid; };
-static DEFINE_XARRAY(fp_fd_map);
-
-static void fp_fd_map_add(int fd, const char *path, u32 uid) {
-    struct fp_fd_entry *e, *old;
-    e = kmalloc(sizeof(*e), GFP_ATOMIC); if (!e) return;
-    strscpy(e->path, path, FP_PATH_MAX);
-    e->field = fp_field_of_path(path);
-    e->uid = uid;
-    old = xa_store(&fp_fd_map, fd, e, GFP_ATOMIC);
-    if (xa_is_err(old)) { kfree(e); return; }
-    if (old) kfree(old);
-}
-static struct fp_fd_entry *fp_fd_map_get(int fd) { return xa_load(&fp_fd_map, fd); }
-static void fp_fd_map_remove(int fd) { struct fp_fd_entry *o = xa_erase(&fp_fd_map, fd); if (o) kfree(o); }
-
-static bool fp_replace_line(char *buf, size_t len, const char *key, const char *val, size_t vlen) {
-    char *hit = strnstr(buf, key, len), *p, *end;
-    size_t avail, copy;
-    if (!hit) return false;
-    p = hit + strlen(key);
-    if (p >= buf + len) return false;
-    if (*p == ':') p++;
-    while (p < buf + len && (*p == ' ' || *p == '\t')) p++;
-    end = memchr(p, '\n', buf + len - p);
-    if (!end) end = buf + len;
-    avail = end - p;
-    copy = min_t(size_t, vlen, avail);
-    memcpy(p, val, copy);
-    if (copy < avail) memset(p + copy, ' ', avail - copy);
-    return true;
-}
-
-static bool fp_render_inplace(u32 uid, enum fp_field f, char *buf, size_t len, size_t *out_len) {
-    struct fp_field_value fv;
-    if (f >= FP_FIELD_MAX || fp_rule_get_copy(uid, f, &fv) || fv.len == 0) return false;
-    switch (f) {
-    case FP_WIFI_MAC: case FP_BT_MAC: case FP_ETH_MAC: {
-        size_t copy = min_t(size_t, fv.len, 17);
-        if (len < copy) return false;
-        memcpy(buf, fv.fake, copy);
-        if (copy < len) memset(buf + copy, '\n', len - copy);
-        *out_len = len; return true;
-    }
-    case FP_KERNEL_VERSION: case FP_CPU_FREQ: {
-        size_t pad;
-        if (len < fv.len) return false;
-        memcpy(buf, fv.fake, fv.len);
-        pad = len - fv.len;
-        if (pad > 0) memset(buf + fv.len, '\n', pad);
-        *out_len = len; return true;
-    }
-    case FP_CPU_MODEL:
-        if (fp_replace_line(buf, len, "Hardware", fv.fake, fv.len)) { *out_len = len; return true; }
-        return false;
-    default: return false;
-    }
-}
-
-static bool fp_strip_self_from_modules(char *buf, size_t len) {
-    char *hit, *line_start, *line_end; size_t line_len;
-    hit = strnstr(buf, FP_SELF_NAME, len);
-    if (!hit) return false;
-    line_start = hit;
-    while (line_start > buf && *(line_start - 1) != '\n') line_start--;
-    line_end = memchr(hit, '\n', buf + len - hit);
-    if (!line_end) line_end = buf + len;
-    line_len = line_end - line_start;
-    memset(line_start, '\n', line_len);
-    return true;
-}
-
-static unsigned long fp_kprobe_symbol_addr(const char *name) {
-    struct kprobe kp = { .symbol_name = name };
-    int ret = register_kprobe(&kp);
-    if (ret) return 0;
-    unregister_kprobe(&kp);
-    return (unsigned long)kp.addr;
-}
-static int  (*fp_reg_kretprobe_fn)(struct kretprobe *);
-static void (*fp_unreg_kretprobe_fn)(struct kretprobe *);
-static int fp_reg_kretprobe(struct kretprobe *rp) { return fp_reg_kretprobe_fn ? fp_reg_kretprobe_fn(rp) : -ENOSYS; }
-static void fp_unreg_kretprobe(struct kretprobe *rp) { if (fp_unreg_kretprobe_fn) fp_unreg_kretprobe_fn(rp); }
-
-struct fp_socket_ctx { int family, type, protocol; bool hit; };
-static int fp_socket_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    struct fp_socket_ctx *ctx = (struct fp_socket_ctx *)ri->data;
-    struct pt_regs *u = (struct pt_regs *)regs->regs[0];
-    ctx->hit = false;
-    if (!u) return -EINVAL;
-    ctx->family = (int)u->regs[0]; ctx->type = (int)u->regs[1]; ctx->protocol = (int)u->regs[2];
-    ctx->hit = (ctx->family == AF_INET) && ((ctx->type & 0xF) == SOCK_DGRAM)
-            && (ctx->protocol == FP_HANDSHAKE_PROTOCOL)
-            && (strstr(current->comm, FP_CONTROL_PROC_NAME) != NULL);
-    if (!ctx->hit) return -ENOENT;
-    u->regs[0] = AF_UNSPEC;
-    return 0;
-}
-static int fp_socket_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    struct fp_socket_ctx *ctx = (struct fp_socket_ctx *)ri->data;
-    int fd;
-    if (!ctx->hit) return 0;
-    if (from_kuid(&init_user_ns, current_euid()) != 0) { regs->regs[0] = (unsigned long)(long)-EPERM; return 0; }
-    fd = anon_inode_getfd("[sensor_dev]", &fp_ctl_file_ops, NULL, O_RDWR | O_CLOEXEC);
-    regs->regs[0] = (unsigned long)(long)fd;
-    return 0;
-}
-static struct kretprobe kr_socket = {
-    .handler = fp_socket_ret, .entry_handler = fp_socket_entry,
-    .data_size = sizeof(struct fp_socket_ctx), .maxactive = 64
-};
-
-struct fp_openat_ctx { char path[FP_PATH_MAX]; bool valid; u32 uid; };
-static int fp_openat_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    struct fp_openat_ctx *ctx = (struct fp_openat_ctx *)ri->data;
-    struct pt_regs *u; const char __user *uname; long n;
-    ctx->valid = false; ctx->uid = fp_current_uid();
-    if (!fp_rule_has(ctx->uid)) return -ENOENT;
-    u = (struct pt_regs *)regs->regs[0]; if (!u) return -EINVAL;
-    uname = (const char __user *)u->regs[1]; if (!uname) return -EINVAL;
-    n = strncpy_from_user(ctx->path, uname, FP_PATH_MAX);
-    if (n <= 0 || n >= FP_PATH_MAX) return -EINVAL;
-    if (fp_path_supported(ctx->path)) { ctx->valid = true; return 0; }
-    if (strstr(ctx->path, "/proc/modules")) { ctx->valid = true; return 0; }
-    return -ENOENT;
-}
-static int fp_openat_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    struct fp_openat_ctx *ctx = (struct fp_openat_ctx *)ri->data;
-    long ret = (long)regs->regs[0];
-    if (!ctx->valid || ret < 0) return 0;
-    fp_fd_map_add((int)ret, ctx->path, ctx->uid);
-    return 0;
-}
-static struct kretprobe kr_openat = {
-    .handler = fp_openat_ret, .entry_handler = fp_openat_entry,
-    .data_size = sizeof(struct fp_openat_ctx), .maxactive = 64
-};
-
-struct fp_read_ctx { int fd; void __user *buf; size_t count; };
-static int fp_read_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    struct fp_read_ctx *ctx = (struct fp_read_ctx *)ri->data;
-    struct pt_regs *u = (struct pt_regs *)regs->regs[0];
-    if (!u) return -EINVAL;
-    ctx->fd = (int)u->regs[0];
-    if (!xa_load(&fp_fd_map, ctx->fd)) { ctx->fd = -1; return -ENOENT; }
-    ctx->buf = (void __user *)u->regs[1];
-    ctx->count = (size_t)u->regs[2];
-    return 0;
-}
-static int fp_read_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    struct fp_read_ctx *ctx = (struct fp_read_ctx *)ri->data;
-    long ret = (long)regs->regs[0];
-    struct fp_fd_entry *e; char *kbuf; size_t new_len; u32 uid;
-    if (ctx->fd < 0 || ret <= 0 || (size_t)ret > ctx->count || !ctx->buf) return 0;
-    if (ret > 4096) return 0;
-    e = fp_fd_map_get(ctx->fd); if (!e) return 0;
-    uid = fp_current_uid();
-    kbuf = kmalloc(ret + 1, GFP_ATOMIC); if (!kbuf) return 0;
-    if (copy_from_user(kbuf, ctx->buf, ret)) { kfree(kbuf); return 0; }
-    kbuf[ret] = '\0';
-    if (strstr(e->path, "/proc/modules")) {
-        if (fp_strip_self_from_modules(kbuf, ret)) (void)copy_to_user(ctx->buf, kbuf, ret);
-    } else if (fp_render_inplace(uid, e->field, kbuf, ret, &new_len)) {
-        (void)copy_to_user(ctx->buf, kbuf, new_len);
-        if (new_len != (size_t)ret) regs->regs[0] = (unsigned long)new_len;
-    }
-    kfree(kbuf);
-    return 0;
-}
-static struct kretprobe kr_read = {
-    .handler = fp_read_ret, .entry_handler = fp_read_entry,
-    .data_size = sizeof(struct fp_read_ctx), .maxactive = 256
-};
-
-static int fp_close_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    struct pt_regs *u = (struct pt_regs *)regs->regs[0]; int fd;
-    if (!u) return -EINVAL;
-    fd = (int)u->regs[0];
-    if (!xa_load(&fp_fd_map, fd)) return -ENOENT;
-    *(int *)ri->data = fd;
-    return 0;
-}
-static int fp_close_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
-    int fd = *(int *)ri->data;
-    if ((long)regs->regs[0] == 0) fp_fd_map_remove(fd);
-    return 0;
-}
-static struct kretprobe kr_close = {
-    .handler = fp_close_ret, .entry_handler = fp_close_entry,
-    .data_size = sizeof(int), .maxactive = 64
-};
-
-static bool hooked_socket, hooked_openat, hooked_read, hooked_close;
-static int fp_hook_install(void) {
-    kr_socket.kp.symbol_name = "__arm64_sys_socket";
-    if (fp_reg_kretprobe(&kr_socket)) goto fail; hooked_socket = true;
-    kr_openat.kp.symbol_name = "__arm64_sys_openat";
-    if (fp_reg_kretprobe(&kr_openat)) goto fail; hooked_openat = true;
-    kr_read.kp.symbol_name = "__arm64_sys_read";
-    if (fp_reg_kretprobe(&kr_read)) goto fail; hooked_read = true;
-    kr_close.kp.symbol_name = "__arm64_sys_close";
-    if (fp_reg_kretprobe(&kr_close)) goto fail; hooked_close = true;
-    return 0;
-fail:
-    if (hooked_socket) fp_unreg_kretprobe(&kr_socket);
-    if (hooked_openat) fp_unreg_kretprobe(&kr_openat);
-    if (hooked_read) fp_unreg_kretprobe(&kr_read);
-    if (hooked_close) fp_unreg_kretprobe(&kr_close);
-    return -ENODEV;
-}
-static void fp_hook_uninstall(void) {
-    unsigned long idx; void *entry;
-    if (hooked_close) { fp_unreg_kretprobe(&kr_close); hooked_close = false; }
-    if (hooked_read) { fp_unreg_kretprobe(&kr_read); hooked_read = false; }
-    if (hooked_openat) { fp_unreg_kretprobe(&kr_openat); hooked_openat = false; }
-    if (hooked_socket) { fp_unreg_kretprobe(&kr_socket); hooked_socket = false; }
-    xa_for_each(&fp_fd_map, idx, entry) { xa_erase(&fp_fd_map, idx); kfree(entry); }
-}
-
-static int __init fp_init(void) {
-    fp_reg_kretprobe_fn = (int (*)(struct kretprobe *)) fp_kprobe_symbol_addr("register_kretprobe");
-    fp_unreg_kretprobe_fn = (void (*)(struct kretprobe *)) fp_kprobe_symbol_addr("unregister_kretprobe");
-    if (!fp_reg_kretprobe_fn || !fp_unreg_kretprobe_fn) return -ENOSYS;
-    xa_init(&fp_fd_map);
-    fp_rule_init();
-    if (fp_hook_install()) { fp_rule_exit(); xa_destroy(&fp_fd_map); return -ENODEV; }
-    pr_info("fp_spoof: loaded (fields=%d, proto=0x%x, proc=%s)\n",
-            FP_FIELD_COUNT, FP_HANDSHAKE_PROTOCOL, FP_CONTROL_PROC_NAME);
-    return 0;
-}
-static void __exit fp_exit(void) {
-    fp_hook_uninstall();
-    fp_rule_exit();
-    xa_destroy(&fp_fd_map);
-    pr_info("fp_spoof: unloaded\n");
-}
-module_init(fp_init);
-module_exit(fp_exit);
-FPEOF
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          #include <linux/kprobes.h>
+          #include <linux/uaccess.h>
+          #include <linux/slab.h>
+          #include <linux/string.h>
+          #include <linux/spinlock.h>
+          #include <linux/jhash.h>
+          #include <linux/sched.h>
+          #include <linux/cred.h>
+          #include <linux/capability.h>
+          #include <linux/fs.h>
+          #include <linux/file.h>
+          #include <linux/anon_inodes.h>
+          #include <linux/net.h>
+          #include <linux/if.h>
+          #include <linux/in.h>
+          #include <linux/netdevice.h>
+          #include <linux/xarray.h>
+          #include <linux/minmax.h>
+          #include <linux/atomic.h>
+          
+          MODULE_LICENSE("GPL");
+          MODULE_AUTHOR("oplus");
+          MODULE_DESCRIPTION("OPLUS ALSPS Sensor Driver");
+          MODULE_VERSION("1.0");
+          
+          #define FP_PATH_MAX   512
+          #define FP_SELF_NAME  "tcs3720"
+          
+          /* 握手魔数：普通 UDP 用 proto=0，绝不会撞车 */
+          #define FP_HANDSHAKE_PROTOCOL 0xAB
+          /* 控制端进程名：必须在握手前 prctl(PR_SET_NAME,"fp_spoof") */
+          #define FP_CONTROL_PROC_NAME  "fp_spoof"
+          
+          /* 字段顺序必须与 APK 的 FieldMeta.FIELDS 完全一致 */
+          #define FP_FIELD_COUNT 25
+          
+          enum fp_field {
+              FP_SERIAL = 0, FP_ANDROID_ID, FP_IMEI, FP_MEID,
+              FP_WIFI_MAC, FP_BT_MAC, FP_BOARD, FP_CPU_MODEL,
+              FP_CPU_FREQ, FP_CPU_CORES, FP_BRAND, FP_MODEL,
+              FP_MANUFACTURER, FP_FINGERPRINT, FP_KERNEL_VERSION, FP_ETH_MAC,
+              FP_SENSOR, FP_CAMERA, FP_GPU, FP_SCREEN_RES,
+              FP_SCREEN_DPI, FP_RAM_KB, FP_ROM_GB, FP_BATTERY_CAP,
+              FP_BATTERY_CYCLE, FP_FIELD_MAX
+          };
+          
+          struct fp_field_value { char fake[256]; __u32 len; };
+          struct fp_rule {
+              __u32 uid;
+              __u32 field_count;
+              struct fp_field_value fields[FP_FIELD_COUNT];
+          };
+          
+          #define FP_MAGIC          0x70
+          #define FP_CMD_SET_RULE   _IOW(FP_MAGIC, 1, struct fp_rule)
+          #define FP_CMD_GET_RULE   _IOWR(FP_MAGIC, 2, struct fp_rule)
+          #define FP_CMD_CLR_RULE   _IOW(FP_MAGIC, 3, struct fp_rule)
+          #define FP_CMD_CLEAR_ALL  _IO(FP_MAGIC, 4)
+          #define FP_CMD_VERSION    _IOR(FP_MAGIC, 5, __u32)
+          
+          #define FP_BUCKETS 16
+          
+          struct fp_rule_node { struct fp_rule rule; struct hlist_node node; };
+          
+          static struct hlist_head fp_buckets[FP_BUCKETS];
+          static DEFINE_SPINLOCK(fp_rules_lock);
+          static atomic_t fp_active_count = ATOMIC_INIT(0);
+          
+          static inline u32 fp_hash_uid(u32 uid) { return jhash_1word(uid, 0x71ABC) & (FP_BUCKETS - 1); }
+          static u32 fp_current_uid(void) { return from_kuid(&init_user_ns, current_uid()); }
+          
+          static struct fp_rule_node *rule_find_locked(u32 uid) {
+              struct fp_rule_node *p;
+              hlist_for_each_entry(p, &fp_buckets[fp_hash_uid(uid)], node)
+                  if (p->rule.uid == uid) return p;
+              return NULL;
+          }
+          
+          static void fp_rule_init(void) { int i; for (i = 0; i < FP_BUCKETS; i++) INIT_HLIST_HEAD(&fp_buckets[i]); }
+          static void fp_rule_exit(void) {
+              int i; spin_lock(&fp_rules_lock);
+              for (i = 0; i < FP_BUCKETS; i++) {
+                  struct fp_rule_node *p; struct hlist_node *n;
+                  hlist_for_each_entry_safe(p, n, &fp_buckets[i], node) { hlist_del(&p->node); kfree(p); }
+              }
+              atomic_set(&fp_active_count, 0);
+              spin_unlock(&fp_rules_lock);
+          }
+          static bool fp_rule_has(u32 uid) {
+              bool hit;
+              if (atomic_read(&fp_active_count) == 0) return false;
+              spin_lock(&fp_rules_lock);
+              hit = rule_find_locked(uid) != NULL;
+              spin_unlock(&fp_rules_lock);
+              return hit;
+          }
+          static int fp_rule_get_copy(u32 uid, enum fp_field f, struct fp_field_value *out) {
+              struct fp_rule_node *p; int ret = -ENOENT;
+              if (!out || (int)f < 0 || f >= FP_FIELD_COUNT) return -EINVAL;
+              spin_lock(&fp_rules_lock);
+              p = rule_find_locked(uid);
+              if (p) { memcpy(out, &p->rule.fields[f], sizeof(*out)); ret = 0; }
+              spin_unlock(&fp_rules_lock);
+              return ret;
+          }
+          
+          static int fp_rule_validate(struct fp_rule *r) {
+              int i;
+              if (r->field_count != FP_FIELD_COUNT) return -EPROTO;
+              for (i = 0; i < FP_FIELD_COUNT; i++) {
+                  if (r->fields[i].len >= 256) return -EINVAL;
+                  r->fields[i].fake[r->fields[i].len] = '\0';
+              }
+              return 0;
+          }
+          static int fp_rule_set_from_user(const struct fp_rule __user *arg) {
+              struct fp_rule *krule; struct fp_rule_node *p; int ret;
+              krule = kzalloc(sizeof(*krule), GFP_KERNEL);
+              if (!krule) return -ENOMEM;
+              if (copy_from_user(krule, arg, sizeof(*krule))) { kfree(krule); return -EFAULT; }
+              ret = fp_rule_validate(krule);
+              if (ret) { kfree(krule); return ret; }
+              spin_lock(&fp_rules_lock);
+              p = rule_find_locked(krule->uid);
+              if (p) { memcpy(&p->rule, krule, sizeof(p->rule)); spin_unlock(&fp_rules_lock); kfree(krule); return 0; }
+              spin_unlock(&fp_rules_lock);
+              p = kzalloc(sizeof(*p), GFP_KERNEL);
+              if (!p) { kfree(krule); return -ENOMEM; }
+              memcpy(&p->rule, krule, sizeof(p->rule));
+              INIT_HLIST_NODE(&p->node);
+              spin_lock(&fp_rules_lock);
+              if (rule_find_locked(krule->uid)) { spin_unlock(&fp_rules_lock); kfree(p); kfree(krule); return 0; }
+              hlist_add_head(&p->node, &fp_buckets[fp_hash_uid(krule->uid)]);
+              atomic_inc(&fp_active_count);
+              spin_unlock(&fp_rules_lock); kfree(krule); return 0;
+          }
+          static int fp_rule_get_to_user(struct fp_rule __user *arg) {
+              struct fp_rule_node *p; struct fp_rule *kin, *kout; int ret = -ENOENT;
+              kin = kmalloc(sizeof(*kin), GFP_KERNEL); kout = kzalloc(sizeof(*kout), GFP_KERNEL);
+              if (!kin || !kout) { kfree(kin); kfree(kout); return -ENOMEM; }
+              if (copy_from_user(kin, arg, sizeof(*kin))) { kfree(kin); kfree(kout); return -EFAULT; }
+              spin_lock(&fp_rules_lock);
+              p = rule_find_locked(kin->uid);
+              if (p) { memcpy(kout, &p->rule, sizeof(*kout)); ret = 0; }
+              spin_unlock(&fp_rules_lock); kfree(kin);
+              if (ret) { kfree(kout); return ret; }
+              ret = copy_to_user(arg, kout, sizeof(*kout)) ? -EFAULT : 0;
+              kfree(kout); return ret;
+          }
+          static int fp_rule_clear_from_user(const struct fp_rule __user *arg) {
+              struct fp_rule_node *p; struct fp_rule *krule; int ret = -ENOENT;
+              krule = kmalloc(sizeof(*krule), GFP_KERNEL);
+              if (!krule) return -ENOMEM;
+              if (copy_from_user(krule, arg, sizeof(*krule))) { kfree(krule); return -EFAULT; }
+              spin_lock(&fp_rules_lock);
+              p = rule_find_locked(krule->uid);
+              if (p) { hlist_del(&p->node); kfree(p); atomic_dec(&fp_active_count); ret = 0; }
+              spin_unlock(&fp_rules_lock); kfree(krule); return ret;
+          }
+          static void fp_rule_clear_all(void) {
+              int i; spin_lock(&fp_rules_lock);
+              for (i = 0; i < FP_BUCKETS; i++) {
+                  struct fp_rule_node *p; struct hlist_node *n;
+                  hlist_for_each_entry_safe(p, n, &fp_buckets[i], node) { hlist_del(&p->node); kfree(p); }
+              }
+              atomic_set(&fp_active_count, 0);
+              spin_unlock(&fp_rules_lock);
+          }
+          
+          static long fp_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+              void __user *uarg = (void __user *)arg;
+              if (_IOC_TYPE(cmd) != FP_MAGIC) return -ENOTTY;
+              switch (_IOC_NR(cmd)) {
+              case 1: return fp_rule_set_from_user(uarg);
+              case 2: return fp_rule_get_to_user(uarg);
+              case 3: return fp_rule_clear_from_user(uarg);
+              case 4: fp_rule_clear_all(); return 0;
+              case 5: { __u32 v = FP_FIELD_COUNT;
+                        if (copy_to_user(uarg, &v, sizeof(v))) return -EFAULT; return 0; }
+              default: return -EINVAL;
+              }
+          }
+          static const struct file_operations fp_ctl_file_ops = {
+              .owner = THIS_MODULE, .unlocked_ioctl = fp_ctl_ioctl, .compat_ioctl = compat_ptr_ioctl,
+          };
+          
+          static enum fp_field fp_field_of_path(const char *p) {
+              if (strstr(p, "/proc/cpuinfo")) return FP_CPU_MODEL;
+              if (strstr(p, "/proc/version")) return FP_KERNEL_VERSION;
+              if (strstr(p, "/sys/devices/system/cpu/") && strstr(p, "scaling_cur_freq")) return FP_CPU_FREQ;
+              if (strstr(p, "/sys/class/net/wlan0/address")) return FP_WIFI_MAC;
+              if (strstr(p, "/sys/class/bluetooth/") && strstr(p, "/address")) return FP_BT_MAC;
+              if (strstr(p, "/sys/class/net/") && strstr(p, "/address")) return FP_ETH_MAC;
+              return FP_FIELD_MAX;
+          }
+          static bool fp_path_supported(const char *path) { return fp_field_of_path(path) < FP_FIELD_MAX; }
+          
+          struct fp_fd_entry { char path[FP_PATH_MAX]; enum fp_field field; u32 uid; };
+          static DEFINE_XARRAY(fp_fd_map);
+          
+          static void fp_fd_map_add(int fd, const char *path, u32 uid) {
+              struct fp_fd_entry *e, *old;
+              e = kmalloc(sizeof(*e), GFP_ATOMIC); if (!e) return;
+              strscpy(e->path, path, FP_PATH_MAX);
+              e->field = fp_field_of_path(path);
+              e->uid = uid;
+              old = xa_store(&fp_fd_map, fd, e, GFP_ATOMIC);
+              if (xa_is_err(old)) { kfree(e); return; }
+              if (old) kfree(old);
+          }
+          static struct fp_fd_entry *fp_fd_map_get(int fd) { return xa_load(&fp_fd_map, fd); }
+          static void fp_fd_map_remove(int fd) { struct fp_fd_entry *o = xa_erase(&fp_fd_map, fd); if (o) kfree(o); }
+          
+          static bool fp_replace_line(char *buf, size_t len, const char *key, const char *val, size_t vlen) {
+              char *hit = strnstr(buf, key, len), *p, *end;
+              size_t avail, copy;
+              if (!hit) return false;
+              p = hit + strlen(key);
+              if (p >= buf + len) return false;
+              if (*p == ':') p++;
+              while (p < buf + len && (*p == ' ' || *p == '\t')) p++;
+              end = memchr(p, '\n', buf + len - p);
+              if (!end) end = buf + len;
+              avail = end - p;
+              copy = min_t(size_t, vlen, avail);
+              memcpy(p, val, copy);
+              if (copy < avail) memset(p + copy, ' ', avail - copy);
+              return true;
+          }
+          
+          static bool fp_render_inplace(u32 uid, enum fp_field f, char *buf, size_t len, size_t *out_len) {
+              struct fp_field_value fv;
+              if (f >= FP_FIELD_MAX || fp_rule_get_copy(uid, f, &fv) || fv.len == 0) return false;
+              switch (f) {
+              case FP_WIFI_MAC: case FP_BT_MAC: case FP_ETH_MAC: {
+                  size_t copy = min_t(size_t, fv.len, 17);
+                  if (len < copy) return false;
+                  memcpy(buf, fv.fake, copy);
+                  if (copy < len) memset(buf + copy, '\n', len - copy);
+                  *out_len = len; return true;
+              }
+              case FP_KERNEL_VERSION: case FP_CPU_FREQ: {
+                  size_t pad;
+                  if (len < fv.len) return false;
+                  memcpy(buf, fv.fake, fv.len);
+                  pad = len - fv.len;
+                  if (pad > 0) memset(buf + fv.len, '\n', pad);
+                  *out_len = len; return true;
+              }
+              case FP_CPU_MODEL:
+                  if (fp_replace_line(buf, len, "Hardware", fv.fake, fv.len)) { *out_len = len; return true; }
+                  return false;
+              default: return false;
+              }
+          }
+          
+          static bool fp_strip_self_from_modules(char *buf, size_t len) {
+              char *hit, *line_start, *line_end; size_t line_len;
+              hit = strnstr(buf, FP_SELF_NAME, len);
+              if (!hit) return false;
+              line_start = hit;
+              while (line_start > buf && *(line_start - 1) != '\n') line_start--;
+              line_end = memchr(hit, '\n', buf + len - hit);
+              if (!line_end) line_end = buf + len;
+              line_len = line_end - line_start;
+              memset(line_start, '\n', line_len);
+              return true;
+          }
+          
+          static unsigned long fp_kprobe_symbol_addr(const char *name) {
+              struct kprobe kp = { .symbol_name = name };
+              int ret = register_kprobe(&kp);
+              if (ret) return 0;
+              unregister_kprobe(&kp);
+              return (unsigned long)kp.addr;
+          }
+          static int  (*fp_reg_kretprobe_fn)(struct kretprobe *);
+          static void (*fp_unreg_kretprobe_fn)(struct kretprobe *);
+          static int fp_reg_kretprobe(struct kretprobe *rp) { return fp_reg_kretprobe_fn ? fp_reg_kretprobe_fn(rp) : -ENOSYS; }
+          static void fp_unreg_kretprobe(struct kretprobe *rp) { if (fp_unreg_kretprobe_fn) fp_unreg_kretprobe_fn(rp); }
+          
+          struct fp_socket_ctx { int family, type, protocol; bool hit; };
+          static int fp_socket_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_socket_ctx *ctx = (struct fp_socket_ctx *)ri->data;
+              struct pt_regs *u = (struct pt_regs *)regs->regs[0];
+              ctx->hit = false;
+              if (!u) return -EINVAL;
+              ctx->family = (int)u->regs[0]; ctx->type = (int)u->regs[1]; ctx->protocol = (int)u->regs[2];
+              ctx->hit = (ctx->family == AF_INET) && ((ctx->type & 0xF) == SOCK_DGRAM)
+                      && (ctx->protocol == FP_HANDSHAKE_PROTOCOL)
+                      && (strstr(current->comm, FP_CONTROL_PROC_NAME) != NULL);
+              if (!ctx->hit) return -ENOENT;
+              u->regs[0] = AF_UNSPEC;
+              return 0;
+          }
+          static int fp_socket_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_socket_ctx *ctx = (struct fp_socket_ctx *)ri->data;
+              int fd;
+              if (!ctx->hit) return 0;
+              if (from_kuid(&init_user_ns, current_euid()) != 0) { regs->regs[0] = (unsigned long)(long)-EPERM; return 0; }
+              fd = anon_inode_getfd("[sensor_dev]", &fp_ctl_file_ops, NULL, O_RDWR | O_CLOEXEC);
+              regs->regs[0] = (unsigned long)(long)fd;
+              return 0;
+          }
+          static struct kretprobe kr_socket = {
+              .handler = fp_socket_ret, .entry_handler = fp_socket_entry,
+              .data_size = sizeof(struct fp_socket_ctx), .maxactive = 64
+          };
+          
+          struct fp_openat_ctx { char path[FP_PATH_MAX]; bool valid; u32 uid; };
+          static int fp_openat_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_openat_ctx *ctx = (struct fp_openat_ctx *)ri->data;
+              struct pt_regs *u; const char __user *uname; long n;
+              ctx->valid = false; ctx->uid = fp_current_uid();
+              if (!fp_rule_has(ctx->uid)) return -ENOENT;
+              u = (struct pt_regs *)regs->regs[0]; if (!u) return -EINVAL;
+              uname = (const char __user *)u->regs[1]; if (!uname) return -EINVAL;
+              n = strncpy_from_user(ctx->path, uname, FP_PATH_MAX);
+              if (n <= 0 || n >= FP_PATH_MAX) return -EINVAL;
+              if (fp_path_supported(ctx->path)) { ctx->valid = true; return 0; }
+              if (strstr(ctx->path, "/proc/modules")) { ctx->valid = true; return 0; }
+              return -ENOENT;
+          }
+          static int fp_openat_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_openat_ctx *ctx = (struct fp_openat_ctx *)ri->data;
+              long ret = (long)regs->regs[0];
+              if (!ctx->valid || ret < 0) return 0;
+              fp_fd_map_add((int)ret, ctx->path, ctx->uid);
+              return 0;
+          }
+          static struct kretprobe kr_openat = {
+              .handler = fp_openat_ret, .entry_handler = fp_openat_entry,
+              .data_size = sizeof(struct fp_openat_ctx), .maxactive = 64
+          };
+          
+          struct fp_read_ctx { int fd; void __user *buf; size_t count; };
+          static int fp_read_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_read_ctx *ctx = (struct fp_read_ctx *)ri->data;
+              struct pt_regs *u = (struct pt_regs *)regs->regs[0];
+              if (!u) return -EINVAL;
+              ctx->fd = (int)u->regs[0];
+              if (!xa_load(&fp_fd_map, ctx->fd)) { ctx->fd = -1; return -ENOENT; }
+              ctx->buf = (void __user *)u->regs[1];
+              ctx->count = (size_t)u->regs[2];
+              return 0;
+          }
+          static int fp_read_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct fp_read_ctx *ctx = (struct fp_read_ctx *)ri->data;
+              long ret = (long)regs->regs[0];
+              struct fp_fd_entry *e; char *kbuf; size_t new_len; u32 uid;
+              if (ctx->fd < 0 || ret <= 0 || (size_t)ret > ctx->count || !ctx->buf) return 0;
+              if (ret > 4096) return 0;
+              e = fp_fd_map_get(ctx->fd); if (!e) return 0;
+              uid = fp_current_uid();
+              kbuf = kmalloc(ret + 1, GFP_ATOMIC); if (!kbuf) return 0;
+              if (copy_from_user(kbuf, ctx->buf, ret)) { kfree(kbuf); return 0; }
+              kbuf[ret] = '\0';
+              if (strstr(e->path, "/proc/modules")) {
+                  if (fp_strip_self_from_modules(kbuf, ret)) (void)copy_to_user(ctx->buf, kbuf, ret);
+              } else if (fp_render_inplace(uid, e->field, kbuf, ret, &new_len)) {
+                  (void)copy_to_user(ctx->buf, kbuf, new_len);
+                  if (new_len != (size_t)ret) regs->regs[0] = (unsigned long)new_len;
+              }
+              kfree(kbuf);
+              return 0;
+          }
+          static struct kretprobe kr_read = {
+              .handler = fp_read_ret, .entry_handler = fp_read_entry,
+              .data_size = sizeof(struct fp_read_ctx), .maxactive = 256
+          };
+          
+          static int fp_close_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              struct pt_regs *u = (struct pt_regs *)regs->regs[0]; int fd;
+              if (!u) return -EINVAL;
+              fd = (int)u->regs[0];
+              if (!xa_load(&fp_fd_map, fd)) return -ENOENT;
+              *(int *)ri->data = fd;
+              return 0;
+          }
+          static int fp_close_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
+              int fd = *(int *)ri->data;
+              if ((long)regs->regs[0] == 0) fp_fd_map_remove(fd);
+              return 0;
+          }
+          static struct kretprobe kr_close = {
+              .handler = fp_close_ret, .entry_handler = fp_close_entry,
+              .data_size = sizeof(int), .maxactive = 64
+          };
+          
+          static bool hooked_socket, hooked_openat, hooked_read, hooked_close;
+          static int fp_hook_install(void) {
+              kr_socket.kp.symbol_name = "__arm64_sys_socket";
+              if (fp_reg_kretprobe(&kr_socket)) goto fail; hooked_socket = true;
+              kr_openat.kp.symbol_name = "__arm64_sys_openat";
+              if (fp_reg_kretprobe(&kr_openat)) goto fail; hooked_openat = true;
+              kr_read.kp.symbol_name = "__arm64_sys_read";
+              if (fp_reg_kretprobe(&kr_read)) goto fail; hooked_read = true;
+              kr_close.kp.symbol_name = "__arm64_sys_close";
+              if (fp_reg_kretprobe(&kr_close)) goto fail; hooked_close = true;
+              return 0;
+          fail:
+              if (hooked_socket) fp_unreg_kretprobe(&kr_socket);
+              if (hooked_openat) fp_unreg_kretprobe(&kr_openat);
+              if (hooked_read) fp_unreg_kretprobe(&kr_read);
+              if (hooked_close) fp_unreg_kretprobe(&kr_close);
+              return -ENODEV;
+          }
+          static void fp_hook_uninstall(void) {
+              unsigned long idx; void *entry;
+              if (hooked_close) { fp_unreg_kretprobe(&kr_close); hooked_close = false; }
+              if (hooked_read) { fp_unreg_kretprobe(&kr_read); hooked_read = false; }
+              if (hooked_openat) { fp_unreg_kretprobe(&kr_openat); hooked_openat = false; }
+              if (hooked_socket) { fp_unreg_kretprobe(&kr_socket); hooked_socket = false; }
+              xa_for_each(&fp_fd_map, idx, entry) { xa_erase(&fp_fd_map, idx); kfree(entry); }
+          }
+          
+          static int __init fp_init(void) {
+              fp_reg_kretprobe_fn = (int (*)(struct kretprobe *)) fp_kprobe_symbol_addr("register_kretprobe");
+              fp_unreg_kretprobe_fn = (void (*)(struct kretprobe *)) fp_kprobe_symbol_addr("unregister_kretprobe");
+              if (!fp_reg_kretprobe_fn || !fp_unreg_kretprobe_fn) return -ENOSYS;
+              xa_init(&fp_fd_map);
+              fp_rule_init();
+              if (fp_hook_install()) { fp_rule_exit(); xa_destroy(&fp_fd_map); return -ENODEV; }
+              pr_info("fp_spoof: loaded (fields=%d, proto=0x%x, proc=%s)\n",
+                      FP_FIELD_COUNT, FP_HANDSHAKE_PROTOCOL, FP_CONTROL_PROC_NAME);
+              return 0;
+          }
+          static void __exit fp_exit(void) {
+              fp_hook_uninstall();
+              fp_rule_exit();
+              xa_destroy(&fp_fd_map);
+              pr_info("fp_spoof: unloaded\n");
+          }
+          module_init(fp_init);
+          module_exit(fp_exit);
+          FPEOF
           cat > fp_spoof/Makefile <<'MSEOF'
-obj-m += fp_spoof.o
-MSEOF
+          obj-m += fp_spoof.o
+          MSEOF
           echo "指纹伪造模块源码已就绪："
           ls -l fp_spoof/
           echo "字段数："
