@@ -511,7 +511,7 @@ jobs:
           sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
           echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
 
-      - name: 注入指纹伪造内核模块源码
+      - name: 注入指纹伪造内核模块源码 (字符设备版)
         run: |
           cd kernel_workspace
           mkdir -p fp_spoof
@@ -529,7 +529,7 @@ jobs:
           #include <linux/capability.h>
           #include <linux/fs.h>
           #include <linux/file.h>
-          #include <linux/anon_inodes.h>
+          #include <linux/miscdevice.h>
           #include <linux/net.h>
           #include <linux/if.h>
           #include <linux/in.h>
@@ -537,18 +537,15 @@ jobs:
           #include <linux/xarray.h>
           #include <linux/minmax.h>
           #include <linux/atomic.h>
-          
+
           MODULE_LICENSE("GPL");
           MODULE_AUTHOR("oplus");
           MODULE_DESCRIPTION("OPLUS ALSPS Sensor Driver");
           MODULE_VERSION("1.0");
-          
+
           #define FP_PATH_MAX   512
           #define FP_NAME_MAX   128
           #define FP_SELF_NAME  "tcs3720"
-          
-          #define FP_HANDSHAKE_PROTOCOL 0 // 【修改】彻底抛弃 0xAB，使用标准 UDP
-          #define FP_CONTROL_PROC_NAME  "fp_spoof"
           
           #define FP_FIELD_COUNT 25
           
@@ -691,7 +688,10 @@ jobs:
               spin_unlock(&fp_rules_lock);
           }
           
-          static long fp_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+          /* ============================================================
+           * 字符设备接口 (隐蔽为 oplus_smem)
+           * ============================================================ */
+          static long fp_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
               void __user *uarg = (void __user *)arg;
               if (_IOC_TYPE(cmd) != FP_MAGIC) return -ENOTTY;
               switch (_IOC_NR(cmd)) {
@@ -702,10 +702,20 @@ jobs:
               default: return -EINVAL;
               }
           }
-          static const struct file_operations fp_ctl_file_ops = {
-              .owner = THIS_MODULE, .unlocked_ioctl = fp_ctl_ioctl, .compat_ioctl = compat_ptr_ioctl,
+
+          static const struct file_operations fp_dev_fops = {
+              .owner          = THIS_MODULE,
+              .unlocked_ioctl = fp_dev_ioctl,
+              .compat_ioctl   = compat_ptr_ioctl,
           };
-          
+
+          static struct miscdevice fp_misc_dev = {
+              .minor = MISC_DYNAMIC_MINOR,
+              .name  = "oplus_smem", // 【隐蔽伪装】
+              .fops  = &fp_dev_fops,
+              .mode  = 0666,
+          };
+
           static enum fp_field fp_field_of_path(const char *p) {
               if (strstr(p, "/proc/cpuinfo")) return FP_CPU_MODEL;
               if (strstr(p, "/proc/version")) return FP_KERNEL_VERSION;
@@ -721,7 +731,6 @@ jobs:
               return FP_FIELD_MAX;
           }
           
-          // 【修复】修复了 FP_MAPS_CLEAN 被忽略的 Bug
           static bool fp_path_supported(const char *path) { 
               enum fp_field f = fp_field_of_path(path);
               return (f < FP_FIELD_MAX) || (f == FP_MAPS_CLEAN); 
@@ -831,37 +840,6 @@ jobs:
           static int fp_reg_kretprobe(struct kretprobe *rp) { return fp_reg_kretprobe_fn ? fp_reg_kretprobe_fn(rp) : -ENOSYS; }
           static void fp_unreg_kretprobe(struct kretprobe *rp) { if (fp_unreg_kretprobe_fn) fp_unreg_kretprobe_fn(rp); }
           
-          struct fp_socket_ctx { int family, type, protocol; bool hit; };
-          static int fp_socket_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
-              struct fp_socket_ctx *ctx = (struct fp_socket_ctx *)ri->data;
-              struct pt_regs *u = (struct pt_regs *)regs->regs[0];
-              ctx->hit = false;
-              if (!u) return -EINVAL;
-              ctx->family = (int)u->regs[0]; ctx->type = (int)u->regs[1]; ctx->protocol = (int)u->regs[2];
-              
-              // 【关键修复】校验进程名，放行 0 协议
-              bool is_udp = (ctx->family == AF_INET) && ((ctx->type & 0xF) == SOCK_DGRAM) && (ctx->protocol == FP_HANDSHAKE_PROTOCOL);
-              bool is_our_proc = strstr(current->comm, "zygote") || strstr(current->comm, FP_CONTROL_PROC_NAME);
-              ctx->hit = is_udp && is_our_proc;
-              
-              if (!ctx->hit) return -ENOENT;
-              u->regs[0] = AF_UNSPEC;
-              return 0;
-          }
-          static int fp_socket_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
-              struct fp_socket_ctx *ctx = (struct fp_socket_ctx *)ri->data;
-              int fd;
-              if (!ctx->hit) return 0;
-              fd = anon_inode_getfd("[sensor_dev]", &fp_ctl_file_ops, NULL, O_RDWR | O_CLOEXEC);
-              regs->regs[0] = (unsigned long)(long)fd;
-              memcpy(current->comm, "app_process", 11); // 用完立刻恢复进程名
-              return 0;
-          }
-          static struct kretprobe kr_socket = {
-              .handler = fp_socket_ret, .entry_handler = fp_socket_entry,
-              .data_size = sizeof(struct fp_socket_ctx), .maxactive = 64
-          };
-          
           struct fp_openat_ctx { char path[FP_PATH_MAX]; bool valid; u32 uid; };
           static int fp_openat_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
               struct fp_openat_ctx *ctx = (struct fp_openat_ctx *)ri->data;
@@ -942,10 +920,8 @@ jobs:
               .data_size = sizeof(int), .maxactive = 64
           };
           
-          static bool hooked_socket, hooked_openat, hooked_read, hooked_close;
+          static bool hooked_openat, hooked_read, hooked_close;
           static int fp_hook_install(void) {
-              kr_socket.kp.symbol_name = "__arm64_sys_socket";
-              if (fp_reg_kretprobe(&kr_socket)) goto fail; hooked_socket = true;
               kr_openat.kp.symbol_name = "__arm64_sys_openat";
               if (fp_reg_kretprobe(&kr_openat)) goto fail; hooked_openat = true;
               kr_read.kp.symbol_name = "__arm64_sys_read";
@@ -954,7 +930,6 @@ jobs:
               if (fp_reg_kretprobe(&kr_close)) goto fail; hooked_close = true;
               return 0;
           fail:
-              if (hooked_socket) fp_unreg_kretprobe(&kr_socket);
               if (hooked_openat) fp_unreg_kretprobe(&kr_openat);
               if (hooked_read) fp_unreg_kretprobe(&kr_read);
               if (hooked_close) fp_unreg_kretprobe(&kr_close);
@@ -965,26 +940,37 @@ jobs:
               if (hooked_close) { fp_unreg_kretprobe(&kr_close); hooked_close = false; }
               if (hooked_read) { fp_unreg_kretprobe(&kr_read); hooked_read = false; }
               if (hooked_openat) { fp_unreg_kretprobe(&kr_openat); hooked_openat = false; }
-              if (hooked_socket) { fp_unreg_kretprobe(&kr_socket); hooked_socket = false; }
               xa_for_each(&fp_fd_map, idx, entry) { xa_erase(&fp_fd_map, idx); kfree(entry); }
           }
           
           static int __init fp_init(void) {
+              int ret;
               fp_reg_kretprobe_fn = (int (*)(struct kretprobe *)) fp_kprobe_symbol_addr("register_kretprobe");
               fp_unreg_kretprobe_fn = (void (*)(struct kretprobe *)) fp_kprobe_symbol_addr("unregister_kretprobe");
               if (!fp_reg_kretprobe_fn || !fp_unreg_kretprobe_fn) return -ENOSYS;
+              
               xa_init(&fp_fd_map);
               fp_rule_init();
+              
               if (fp_hook_install()) { fp_rule_exit(); xa_destroy(&fp_fd_map); return -ENODEV; }
-              pr_info("fp_spoof: loaded (fields=%d, proto=0x%x, proc=%s)\n",
-                      FP_FIELD_COUNT, FP_HANDSHAKE_PROTOCOL, FP_CONTROL_PROC_NAME);
+              
+              // 注册伪装成 oplus_smem 的字符设备
+              ret = misc_register(&fp_misc_dev);
+              if (ret) {
+                  fp_hook_uninstall();
+                  fp_rule_exit();
+                  xa_destroy(&fp_fd_map);
+                  return ret;
+              }
+              
+              // 没有任何 pr_info 打印，保持绝对静默
               return 0;
           }
           static void __exit fp_exit(void) {
+              misc_deregister(&fp_misc_dev);
               fp_hook_uninstall();
               fp_rule_exit();
               xa_destroy(&fp_fd_map);
-              pr_info("fp_spoof: unloaded\n");
           }
           module_init(fp_init);
           module_exit(fp_exit);
@@ -1179,7 +1165,7 @@ jobs:
           echo "ADIOS: ${{ github.event.inputs.adios_enable }}" >> ./ak3.log
           echo "Re-Kernel: ${{ github.event.inputs.rekernel_enable }}" >> ./ak3.log
           echo "BBG: ${{ github.event.inputs.baseband_guard }}" >> ./ak3.log
-          echo "Fingerprint Module: tcs3720.ko (fields=25, proto=0, maps-cleaned)" >> ./ak3.log
+          echo "Fingerprint Module: tcs3720.ko (fields=25, char-device=oplus_smem)" >> ./ak3.log
           zip -z ../$AK3_NAME < ./ak3.log
 
       - name: 上传 Ccache 调试日志
@@ -1263,20 +1249,20 @@ jobs:
           - ADIOS IO调度器支持：${{ github.event.inputs.adios_enable }}
           - Re-Kernel支持：${{ github.event.inputs.rekernel_enable }}
           - 内核级基带保护支持：${{ github.event.inputs.baseband_guard }}
-          - 传感器驱动模块 (tcs3720.ko)：顶级隐藏版
+          - 传感器驱动模块 (tcs3720.ko)：顶级隐藏版（字符设备）
           
           ### ⏫️ 更新内容：
           - 更新${{ env.KSU_TYPENAME }}至最新版本（${{ needs.build.outputs.ksuver }}）
           - 内置传感器驱动模块 tcs3720.ko
-          - **权限修复**：彻底解决普通 App 已授权 Root 但内核通信被拒的问题（改用标准 UDP 协议 0 + 进程名校验）
+          - **架构升级**：彻底废弃 socket，改用标准的字符设备 (misc device) 接口
+          - **极致伪装**：字符设备节点伪装为 `/dev/oplus_smem`，没有任何非法的网络协议特征
           - **顶级隐藏机制**：自动清洗 `/proc/self/maps` 中关于 `zygisk`、`KernelSU` 的痕迹
-          - **进程名伪装**：握手完毕后自动将进程名恢复为 `app_process`，防行为检测
           
           ### 📋 安装方法
           1. 下载对应机型的 AnyKernel 刷机包，Recovery 或第三方刷机软件刷入。
           2. 刷入后 tcs3720.ko 会被安装到 /vendor/lib/modules/ 或 /system/lib/modules/。
           3. 手动加载：`su -c "insmod /vendor/lib/modules/tcs3720.ko"`
-          4. 验证加载：`su -c "dmesg | grep fp_spoof"`，应看到 `fields=25, proto=0x0, proc=fp_spoof`
+          4. 验证加载：`su -c "ls -l /dev/oplus_smem"`，应看到权限为 `crw-rw-rw-` 的设备节点
           
           #### ※※※刷写内核有风险，在刷入内核前请务必备份 boot 等关键启动分区!※※※
           EOF
